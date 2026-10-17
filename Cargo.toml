@@ -15,8 +15,12 @@ bytemuck = "1.25.2"
 clap = { version = "4.6.7", features = ["derive"] }
 ignore = "0.4.33"
 memmap2 = "0.9.11"
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "download-binaries", "tls-rustls"], optional = true }
+sha2 = "0.11.1"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"], optional = true }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 zstd = "0.14.3"
 
 [[bin]]
@@ -25,8 +29,8 @@ path = "src/main.rs"
 
 [features]
 default = ["onnx", "mcp"]
-# Heavy deps (ort, tokenizers / rmcp, tokio) become optional members of these in later tasks.
-onnx = []
+# ONNX Runtime (prebuilt, statically linked; fetched at build time) + HF tokenizers.
+onnx = ["dep:ort", "dep:tokenizers"]
 mcp = []
 
 [dev-dependencies]

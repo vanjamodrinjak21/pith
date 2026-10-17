@@ -27,6 +27,14 @@ pub enum Error {
     CorruptDb(String),
     #[error("invalid input: {0}")]
     Invalid(String),
+    #[error("embedding model not found: {0}; run `pith init` to download it")]
+    ModelMissing(String),
+    #[error("model download failed: {0}")]
+    Download(String),
+    #[error("model file failed verification: {0}")]
+    Integrity(String),
+    #[error("embedding failed: {0}")]
+    Embed(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
