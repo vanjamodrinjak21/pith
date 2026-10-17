@@ -1,17 +1,21 @@
 //! Secrets deny list. Pure path matching, so it runs before any file is opened.
+//!
+//! Names are matched case-insensitively with trailing dots and spaces trimmed
+//! (Windows ignores them, so `server.pem.` is `server.pem`).
 
 use std::path::{Component, Path};
 
 const SAFE_ENV: [&str; 3] = [".env.example", ".env.sample", ".env.template"];
+/// Denied when ANY dot-separated segment after the first matches (`server.pem.bak`).
 const DENIED_EXT: [&str; 8] = ["pem", "key", "p12", "pfx", "jks", "keystore", "kdbx", "ppk"];
-const DENIED_NAMES: [&str; 13] = [
-    "id_rsa",
-    "id_dsa",
-    "id_ecdsa",
-    "id_ed25519",
+const KEY_PREFIXES: [&str; 4] = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
+const DENIED_NAMES: [&str; 12] = [
     ".npmrc",
     ".pypirc",
     ".netrc",
+    ".git-credentials",
+    ".htpasswd",
+    ".envrc",
     "credentials",
     "credentials.json",
     "secrets.json",
@@ -19,11 +23,31 @@ const DENIED_NAMES: [&str; 13] = [
     "secrets.yml",
     ".env",
 ];
+/// A denied name plus one of these is a backup of a secret (`credentials.bak`);
+/// `credentials.rs` is source and stays indexed.
+const BACKUP_SUFFIXES: [&str; 9] = [
+    ".bak", ".old", ".orig", ".save", ".backup", ".tmp", ".swp", ".copy", "~",
+];
+/// `(directory, file)` pairs, matched on consecutive components.
+const DENIED_PAIRS: [(&str, &str); 3] = [
+    (".aws", "credentials"),
+    (".docker", "config.json"),
+    (".kube", "config"),
+];
+/// A project root inside one of these directories is refused outright.
+const SENSITIVE_ROOTS: [&str; 5] = [".ssh", ".gnupg", ".aws", ".docker", ".kube"];
+
+fn norm(s: &std::ffi::OsStr) -> String {
+    s.to_string_lossy()
+        .to_lowercase()
+        .trim_end_matches(['.', ' '])
+        .to_owned()
+}
 
 fn lower_components(p: &Path) -> Vec<String> {
     p.components()
         .filter_map(|c| match c {
-            Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+            Component::Normal(s) => Some(norm(s)),
             _ => None,
         })
         .collect()
@@ -33,8 +57,32 @@ fn dir_denied(parts: &[String]) -> bool {
     parts.iter().any(|c| c == ".ssh" || c == ".gnupg")
 }
 
+fn name_denied(n: &str) -> bool {
+    if SAFE_ENV.contains(&n) {
+        return false;
+    }
+    let core = BACKUP_SUFFIXES
+        .iter()
+        .find_map(|s| n.strip_suffix(s))
+        .unwrap_or(n);
+    if DENIED_NAMES.contains(&core)
+        || ((core.starts_with("service-account") || core.starts_with("service_account"))
+            && core.ends_with(".json"))
+    {
+        return true;
+    }
+    if KEY_PREFIXES.iter().any(|p| n.starts_with(p)) && !n.ends_with(".pub") {
+        return true;
+    }
+    n.starts_with(".env.")
+        || n.ends_with(".env")
+        || n.split('.')
+            .skip(1)
+            .any(|seg| DENIED_EXT.contains(&seg) || seg == "tfvars" || seg.starts_with("tfstate"))
+}
+
 /// True when `rel_path` (relative to the project root) must never be read or indexed.
-/// Case-insensitive; `.env.example`-style templates and `.pub` keys stay allowed.
+/// `.env.example`-style templates and `.pub` keys stay allowed.
 pub fn is_denied(rel_path: &Path) -> bool {
     let parts = lower_components(rel_path);
     if dir_denied(&parts) {
@@ -42,27 +90,24 @@ pub fn is_denied(rel_path: &Path) -> bool {
     }
     if parts
         .windows(2)
-        .any(|w| w[0] == ".aws" && w[1] == "credentials")
+        .any(|w| DENIED_PAIRS.iter().any(|(d, f)| w[0] == *d && w[1] == *f))
     {
         return true;
     }
-    let Some(name) = parts.last() else {
-        return false;
-    };
-    if SAFE_ENV.contains(&name.as_str()) {
-        return false;
-    }
-    DENIED_NAMES.contains(&name.as_str())
-        || name.starts_with(".env.")
-        || (name.starts_with("service-account") && name.ends_with(".json"))
-        || name
-            .rsplit_once('.')
-            .is_some_and(|(_, ext)| DENIED_EXT.contains(&ext))
+    parts.last().is_some_and(|n| name_denied(n))
 }
 
 /// Directory-only check (file-name rules must not hide a directory called `credentials`).
 pub(super) fn is_denied_dir(rel_path: &Path) -> bool {
     dir_denied(&lower_components(rel_path))
+}
+
+/// True when the (canonical) project root lies inside a secrets directory, where the
+/// relative-path rules above cannot see the sensitive component.
+pub(super) fn is_denied_root(canonical_root: &Path) -> bool {
+    lower_components(canonical_root)
+        .iter()
+        .any(|c| SENSITIVE_ROOTS.contains(&c.as_str()))
 }
 
 /// The database and its lock / temp sidecars.

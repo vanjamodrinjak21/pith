@@ -1,4 +1,9 @@
 //! Ingest: walk a project, drop secrets and junk, window files into chunks.
+//!
+//! The walk honours `.gitignore`, `.ignore`, `.git/info/exclude` and a project-local
+//! `.pithignore` (never the global gitignore, never parent directories). Dot-files and
+//! dot-directories are walked on purpose so the secrets deny list, not the walker's
+//! hidden-file filter, decides what is excluded; `.git` itself is never entered.
 
 mod chunk;
 mod deny;
@@ -29,6 +34,10 @@ pub enum SkipReason {
     /// NUL byte in the first 8 KiB.
     Binary,
     NotUtf8,
+    /// FIFO, socket or device; never opened.
+    SpecialFile,
+    /// Contains a PEM private-key header.
+    Secret,
     /// Larger than [`MAX_FILE_BYTES`].
     TooLarge,
     Empty,

@@ -1,5 +1,11 @@
 //! Window chunker. Guarantees every chunk is at most `CHUNK_MAX_CHARS` chars and
-//! `MAX_LINES` lines, with `OVERLAP` lines shared between consecutive windows.
+//! `MAX_LINES` lines.
+//!
+//! Consecutive windows share up to `OVERLAP` (10) lines. A literal 10-line overlap is
+//! impossible when lines are long, so the overlap shrinks, down to 0, when the
+//! character limit crowds the window (200-char lines overlap by 5; lines of 700+
+//! chars do not overlap). Coverage and forward progress always hold. A line longer
+//! than the character limit is split into pieces at char boundaries, never mid-codepoint.
 
 use super::SourceChunk;
 use crate::CHUNK_MAX_CHARS;
@@ -100,6 +106,23 @@ mod tests {
             1 => "[a-zé€𝄞]{1300,4200}",
             1 => Just(String::new()),
         ]
+    }
+
+    #[test]
+    fn overlap_shrinks_when_chars_crowd_the_window() {
+        let text = |len: usize| (0..30).map(|_| "x".repeat(len) + "\n").collect::<String>();
+        let ranges = |len| -> Vec<(u32, u32)> {
+            chunk_text("f", &text(len))
+                .iter()
+                .map(|c| (c.start_line, c.end_line))
+                .collect()
+        };
+        // 6 lines of 200 chars fit (1205 chars); 7 do not. Overlap 5.
+        assert_eq!(&ranges(200)[..2], [(1, 6), (2, 7)]);
+        // 699-char lines: 2 fit (1399). Overlap 1.
+        assert_eq!(&ranges(699)[..2], [(1, 2), (2, 3)]);
+        // 700-char lines: only 1 fits (2 need 1401). Overlap 0.
+        assert_eq!(&ranges(700)[..2], [(1, 1), (2, 2)]);
     }
 
     proptest! {
