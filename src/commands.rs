@@ -61,12 +61,14 @@ pub fn load_default_embedder() -> Result<Box<dyn Embedder>> {
     Ok(Box::new(crate::embed::OnnxEmbedder::load(&dir)?))
 }
 
+/// Error text when the build has no embedding support.
+#[cfg(not(feature = "onnx"))]
+pub(crate) const NO_ONNX: &str =
+    "this build of pith has no embedding model support (built without the `onnx` feature)";
+
 #[cfg(not(feature = "onnx"))]
 pub fn load_default_embedder() -> Result<Box<dyn Embedder>> {
-    Err(Error::Invalid(
-        "this build of pith has no embedding model support (built without the `onnx` feature)"
-            .into(),
-    ))
+    Err(Error::Invalid(NO_ONNX.into()))
 }
 
 /// Refuses to overwrite an index built with another model, or one that cannot be read.

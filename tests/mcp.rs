@@ -1,49 +1,14 @@
 // Needs `test-hooks` (enabled for tests by the self dev-dependency in Cargo.toml).
 #![cfg(all(feature = "mcp", feature = "test-hooks"))]
 
-use pithdb::mcp::fit_budget;
-use pithdb::SearchHit;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-fn hit(id: u32, path: &str, lines: usize) -> SearchHit {
-    SearchHit {
-        chunk_id: id,
-        score: 1.0,
-        path: path.into(),
-        start_line: 1,
-        end_line: lines as u32,
-        text: (1..=lines)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        source_changed: false,
-    }
-}
-
-#[test]
-fn fit_budget_caps_three_hits_per_file() {
-    let hits = (0..5)
-        .map(|i| hit(i, "a.rs", 3))
-        .chain([hit(9, "b.rs", 3)])
-        .collect();
-    let out = fit_budget(hits, 4000, 3, 15);
-    let ids: Vec<u32> = out.iter().map(|h| h.chunk_id).collect();
-    assert_eq!(ids, [0, 1, 2, 9]);
-}
-
-#[test]
-fn fit_budget_trims_snippets_to_15_lines() {
-    let out = fit_budget(vec![hit(0, "a.rs", 40)], 4000, 3, 15);
-    assert_eq!(out[0].text.lines().count(), 15);
-    assert!(out[0].text.ends_with("line 15"));
-}
-
 struct Session {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
 }
@@ -66,7 +31,7 @@ impl Session {
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut s = Session {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout,
             next_id: 1,
         };
@@ -81,8 +46,9 @@ impl Session {
     }
 
     fn send(&mut self, v: Value) {
-        writeln!(self.stdin, "{v}").unwrap();
-        self.stdin.flush().unwrap();
+        let w = self.stdin.as_mut().unwrap();
+        writeln!(w, "{v}").unwrap();
+        w.flush().unwrap();
     }
 
     /// Every stdout line must be a JSON-RPC message: nothing else may print there.
@@ -198,9 +164,24 @@ fn search_code_with_no_model_says_run_pith_init() {
 fn overlong_stdin_line_ends_the_session() {
     let d = fixture();
     let mut s = Session::start(d.path(), &d.path().join("home"), true);
-    let _ = s.stdin.write_all(&vec![b'x'; 2 << 20]);
-    let _ = s.stdin.flush();
-    let mut line = String::new();
-    assert_eq!(s.stdout.read_line(&mut line).unwrap_or(0), 0, "{line}");
-    assert!(s.child.wait().is_ok());
+    // Write from a thread: a regressed cap would block the pipe instead of failing the test.
+    let mut stdin = s.stdin.take().unwrap();
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(&vec![b'x'; 2 << 20]);
+        let _ = stdin.flush();
+        std::thread::sleep(std::time::Duration::from_secs(60)); // keep stdin open
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(st) = s.child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server did not end the session on an overlong line"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // The read error ends the session and `pith mcp` exits with an error status.
+    assert!(!status.success(), "{status}");
 }

@@ -2,6 +2,10 @@
 //! `stats`. It never indexes, never writes, and never takes the writer lock. Stdout carries only
 //! the protocol; nothing else in this process may print there.
 
+// Release builds must never carry the test hook.
+#[cfg(all(feature = "test-hooks", not(debug_assertions)))]
+compile_error!("the `test-hooks` feature is for debug test builds only");
+
 mod budget;
 mod tools;
 
@@ -75,9 +79,12 @@ impl State {
         f(e.as_ref())
     }
 
-    fn unload_if_idle(&self, idle: Duration) {
+    /// Drops the embedder when it was last used at least `idle` before `now`.
+    fn unload_if_idle(&self, now: Instant, idle: Duration) {
         let mut g = lock(&self.embedder);
-        if g.as_ref().is_some_and(|(_, t)| t.elapsed() >= idle) {
+        if g.as_ref()
+            .is_some_and(|(_, t)| now.saturating_duration_since(*t) >= idle)
+        {
             *g = None;
         }
     }
@@ -95,10 +102,7 @@ fn load_embedder() -> Result<Loaded> {
         &crate::embed::models_dir()?,
     )?));
     #[cfg(not(feature = "onnx"))]
-    return Err(Error::Invalid(
-        "this build of pith has no embedding model support (built without the `onnx` feature)"
-            .into(),
-    ));
+    return Err(Error::Invalid(crate::commands::NO_ONNX.into()));
 }
 
 /// Serves MCP over stdio until the client closes stdin. The project is `project` or the current
@@ -119,7 +123,7 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(30));
         match weak.upgrade() {
-            Some(s) => s.unload_if_idle(IDLE_UNLOAD),
+            Some(s) => s.unload_if_idle(Instant::now(), IDLE_UNLOAD),
             None => return,
         }
     });
@@ -176,11 +180,15 @@ mod tests {
     #[test]
     fn unload_if_idle_respects_the_boundary() {
         let s = State::new(PathBuf::from("."));
-        *lock(&s.embedder) = Some((Box::new(FakeEmbedder), Instant::now()));
-        s.unload_if_idle(Duration::from_secs(3600));
-        assert!(lock(&s.embedder).is_some(), "not idle long enough");
-        s.unload_if_idle(Duration::ZERO);
-        assert!(lock(&s.embedder).is_none(), "idle past the limit");
+        let t0 = Instant::now();
+        *lock(&s.embedder) = Some((Box::new(FakeEmbedder), t0));
+        s.unload_if_idle(t0 + IDLE_UNLOAD - Duration::from_nanos(1), IDLE_UNLOAD);
+        assert!(
+            lock(&s.embedder).is_some(),
+            "1ns short of the limit keeps it"
+        );
+        s.unload_if_idle(t0 + IDLE_UNLOAD, IDLE_UNLOAD);
+        assert!(lock(&s.embedder).is_none(), "exactly the limit unloads");
     }
 
     #[test]
@@ -212,5 +220,18 @@ mod tests {
         };
         assert!(read(b"12345678\n12345678\n".to_vec()).is_ok());
         assert!(read(b"123456789\n".to_vec()).is_err());
+        // The run of bytes without a newline carries over between reads.
+        let chunked = |a: &'static [u8], b: &'static [u8]| {
+            rt.block_on(async {
+                let mut out = Vec::new();
+                LineCap::new(a.chain(b), 8)
+                    .read_to_end(&mut out)
+                    .await
+                    .map(|_| out)
+            })
+        };
+        assert!(chunked(b"12345", b"6789\n").is_err());
+        assert!(chunked(b"1234", b"5678\n1").is_ok());
+        assert!(chunked(b"12\n345678", b"123").is_err());
     }
 }

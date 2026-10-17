@@ -93,15 +93,51 @@ mod tests {
         }
     }
 
+    fn hit(id: u32, path: &str, lines: usize) -> SearchHit {
+        SearchHit {
+            chunk_id: id,
+            score: 1.0,
+            path: path.into(),
+            start_line: 1,
+            end_line: lines as u32,
+            text: (1..=lines)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            source_changed: false,
+        }
+    }
+
+    #[test]
+    fn fit_budget_caps_three_hits_per_file() {
+        let hits = (0..5)
+            .map(|i| hit(i, "a.rs", 3))
+            .chain([hit(9, "b.rs", 3)])
+            .collect();
+        let ids: Vec<u32> = fit_budget(hits, 4000, 3, 15)
+            .iter()
+            .map(|h| h.chunk_id)
+            .collect();
+        assert_eq!(ids, [0, 1, 2, 9]);
+    }
+
+    #[test]
+    fn fit_budget_trims_snippets_to_15_lines() {
+        let out = fit_budget(vec![hit(0, "a.rs", 40)], 4000, 3, 15);
+        assert_eq!(out[0].text.lines().count(), 15);
+        assert!(out[0].text.ends_with("line 15"));
+    }
+
     #[test]
     fn fit_budget_stops_before_exceeding_token_cap() {
-        let out = fit_budget((0..10).map(big).collect(), 1000, 3, 15);
-        assert!(!out.is_empty() && out.len() < 10, "{}", out.len());
+        // One trimmed hit costs about 410 tokens, so exactly one fits in 600.
+        let out = fit_budget((0..10).map(big).collect(), 600, 3, 15);
+        assert_eq!(out.len(), 1);
         let used: usize = out
             .iter()
             .map(|h| tokens(render_hit(h).chars().count()))
             .sum();
-        assert!(used <= 1000, "{used}");
+        assert!(used <= 600, "{used}");
         // Order is kept: it stops, it does not skip ahead.
         assert_eq!(out.last().unwrap().chunk_id as usize, out.len() - 1);
     }
