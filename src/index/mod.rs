@@ -47,10 +47,7 @@ impl VectorIndex {
             });
         }
         if dim == 0 && !vectors.is_empty() {
-            return Err(Error::DimMismatch {
-                expected: 1,
-                got: 0,
-            });
+            return Err(Error::EmptyVector);
         }
         let full: Vec<f32> = vectors.into_iter().flatten().collect();
         check_parts(dim, &full)?;
@@ -114,15 +111,19 @@ impl VectorIndex {
 
     /// Like [`try_search`](Self::try_search), but returns empty on a dimension
     /// mismatch or a non-finite query. The query must be L2-normalized so the
-    /// dot product equals cosine.
+    /// dot product equals cosine (an unnormalized query only scales scores).
     pub fn search(&self, query: &[f32], k: usize) -> Vec<Hit> {
         self.try_search(query, k).unwrap_or_default()
     }
 
     /// Top `min(k, len)` hits by cosine, descending (ties by ascending id).
-    /// The query must be L2-normalized so the dot product equals cosine.
+    /// The query must be L2-normalized so the dot product equals cosine; an
+    /// unnormalized query only scales the scores and does not change the ranking.
+    /// The query is validated before `k == 0` or emptiness short-circuits; the one
+    /// exception is a dimensionless index (`dim() == 0`, built from no vectors),
+    /// which has nothing to validate against and returns `Ok(vec![])`.
     pub fn try_search(&self, query: &[f32], k: usize) -> Result<Vec<Hit>> {
-        if self.is_empty() || k == 0 {
+        if self.dim == 0 {
             return Ok(Vec::new());
         }
         if query.len() != self.dim {
@@ -134,10 +135,9 @@ impl VectorIndex {
         if query.iter().any(|x| !x.is_finite()) {
             return Err(Error::NonFinite);
         }
-        debug_assert!(
-            (query.iter().map(|x| x * x).sum::<f32>().sqrt() - 1.0).abs() < 1e-3,
-            "query must be L2-normalized"
-        );
+        if self.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
         let q8 = quant::quantize(query, self.scale);
         let cap = k.saturating_mul(CANDIDATE_MULT).max(32).min(self.len());
         // Min-heap of the best `cap` int8 scores.

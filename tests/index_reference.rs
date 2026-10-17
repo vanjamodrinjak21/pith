@@ -109,7 +109,10 @@ fn non_finite_rejected() {
 
 #[test]
 fn zero_length_rows_rejected() {
-    assert!(VectorIndex::build(vec![vec![], vec![]]).is_err());
+    assert!(matches!(
+        VectorIndex::build(vec![vec![], vec![]]),
+        Err(Error::EmptyVector)
+    ));
 }
 
 #[test]
@@ -203,4 +206,30 @@ fn dim_not_multiple_of_16_matches_naive() {
         let got: Vec<u32> = idx.search(&q, 5).iter().map(|h| h.id).collect();
         assert_eq!(got, naive[..5].iter().map(|h| h.0).collect::<Vec<_>>());
     }
+}
+
+#[test]
+fn bad_query_errors_even_when_k_zero_or_index_empty() {
+    let idx = VectorIndex::build(vec![vec![1.0, 0.0]]).unwrap();
+    assert!(matches!(
+        idx.try_search(&[1.0], 0),
+        Err(Error::DimMismatch { .. })
+    ));
+    assert!(matches!(
+        idx.try_search(&[f32::NAN, 0.0], 0),
+        Err(Error::NonFinite)
+    ));
+    let empty = VectorIndex::from_parts(2, vec![], vec![]).unwrap();
+    assert!(matches!(
+        empty.try_search(&[1.0], 3),
+        Err(Error::DimMismatch { .. })
+    ));
+    assert!(matches!(
+        empty.try_search(&[f32::INFINITY, 0.0], 3),
+        Err(Error::NonFinite)
+    ));
+    assert!(empty.try_search(&[1.0, 0.0], 3).unwrap().is_empty());
+    // dim 0 = no dimension yet: any query yields an empty result.
+    let blank = VectorIndex::build(vec![]).unwrap();
+    assert!(blank.try_search(&[1.0, 2.0], 3).unwrap().is_empty());
 }
