@@ -47,7 +47,8 @@ pub struct Stats {
     pub git_head: Option<String>,
 }
 
-fn now_unix() -> u64 {
+/// Seconds since the Unix epoch.
+pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -113,19 +114,29 @@ fn git_head(root: &Path) -> Option<String> {
 /// append go through that handle.
 fn update_gitignore(root: &Path) -> Result<()> {
     use std::io::{Read, Write};
-    let mut o = std::fs::OpenOptions::new();
-    o.read(true).append(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(
-        &mut o,
-        (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
-    );
-    let mut f = match o.open(root.join(".gitignore")) {
+    let path = root.join(".gitignore");
+    let open = |write: bool| {
+        let mut o = std::fs::OpenOptions::new();
+        if write {
+            o.append(true);
+        } else {
+            o.read(true);
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(
+            &mut o,
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+        );
+        o.open(&path)
+    };
+    // Read-only first: only a regular file is ever reopened for writing.
+    let mut f = match open(false) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    if !f.metadata()?.is_file() {
+    let meta = f.metadata()?;
+    if !meta.is_file() {
         return Err(Error::Invalid(".gitignore is not a regular file".into()));
     }
     let mut bytes = Vec::new();
@@ -149,7 +160,18 @@ fn update_gitignore(root: &Path) -> Result<()> {
     if !bytes.is_empty() && !bytes.ends_with(b"\n") {
         add.insert(0, '\n');
     }
-    f.write_all(add.as_bytes())?;
+    let mut w = open(true)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = w.metadata()?;
+        if !m.is_file() || (m.dev(), m.ino()) != (meta.dev(), meta.ino()) {
+            return Err(Error::Invalid(
+                ".gitignore changed while it was being updated".into(),
+            ));
+        }
+    }
+    w.write_all(add.as_bytes())?;
     Ok(())
 }
 
@@ -158,6 +180,31 @@ fn update_gitignore(root: &Path) -> Result<()> {
 /// taken only for the final write, so a second concurrent writer fails with `Error::Locked`
 /// after it has done its embedding work. Progress goes to stderr, only when stderr is a TTY.
 pub fn index_project(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Result<IndexReport> {
+    if !root.metadata()?.is_dir() {
+        return Err(Error::Invalid(format!(
+            "{} is not a directory",
+            root.display()
+        )));
+    }
+    let r = index_inner(root, embedder, reindex);
+    // The lock file exists after any attempt (even a failed one), so keep it ignored on every exit.
+    if let Some(w) = gitignore_warning(root) {
+        eprintln!("{w}");
+    }
+    r
+}
+
+/// Best-effort `.gitignore` update; returns the warning text on failure.
+fn gitignore_warning(root: &Path) -> Option<String> {
+    update_gitignore(root).err().map(|e| {
+        format!(
+            "pith: warning: could not update .gitignore: {}",
+            clean(&e.to_string())
+        )
+    })
+}
+
+fn index_inner(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Result<IndexReport> {
     let db_path = root.join(DB_NAME);
     // Fail fast if another writer is active, before the expensive embedding. Racy by nature: a
     // writer may start after this check, in which case `Db::write` still returns Locked.
@@ -166,7 +213,7 @@ pub fn index_project(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Res
         check_existing(&db_path, embedder)?;
     }
     // Taken before the walk: any file edited after this second is flagged by `source_changed`.
-    let indexed_at_unix = now_unix();
+    let indexed_at_unix = unix_now();
     let CollectReport { chunks, skipped } = collect(root)?;
     let total = chunks.len();
     let progress = total > 0 && std::io::stderr().is_terminal();
@@ -219,10 +266,6 @@ pub fn index_project(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Res
         git_head: git_head(root),
     };
     Db::write(&db_path, embedder.model_id(), stored, &index, meta)?;
-    // The index is already written; a .gitignore problem must not fail the run.
-    if let Err(e) = update_gitignore(root) {
-        eprintln!("pith: warning: could not update .gitignore: {e}");
-    }
     Ok(IndexReport {
         chunks: total,
         files,
@@ -281,9 +324,9 @@ fn changed_since(root: &Path, rel: &str, indexed_at_unix: u64) -> bool {
         .is_none_or(|d| d.as_secs() > indexed_at_unix)
 }
 
-/// Top-`k` chunks for `query` (k must be at least 1; capped at 100). `root` is the project root, used only to
-/// compute `source_changed`. Errors with `ModelMismatch` if the embedder is not the one that
-/// built the database.
+/// Top-`k` chunks for `query` (k must be at least 1; capped at 100). `root` is the project
+/// root, used only to compute `source_changed`. Errors with `ModelMismatch` if the embedder is
+/// not the one that built the database.
 pub fn search_project(
     root: &Path,
     db: &Db,
@@ -340,7 +383,7 @@ pub fn stats_project(root: &Path, db: &Db) -> Result<Stats> {
         model_id: clean(db.model_id()),
         db_bytes: std::fs::metadata(root.join(DB_NAME))?.len(),
         indexed_at_unix: at,
-        age_secs: now_unix().saturating_sub(at),
+        age_secs: unix_now().saturating_sub(at),
         git_head: db.meta().git_head.as_deref().map(|h| {
             let ok = matches!(h.len(), 40 | 64)
                 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
@@ -414,13 +457,19 @@ pub fn render_stats(s: &Stats) -> String {
     out
 }
 
+/// The text after `pith: ` for a failed command; sanitised because errors embed paths.
+pub fn render_error(e: &Error) -> String {
+    match e {
+        Error::Locked => {
+            "another pith process is writing this index; wait for it to finish and retry".into()
+        }
+        e => clean(&e.to_string()),
+    }
+}
+
 /// `[Y/n]` answer: empty, `y` or `yes` (any case) is yes; everything else is no.
 pub fn is_yes(line: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
-}
-
-pub fn now() -> u64 {
-    now_unix()
 }
 
 /// Compact stderr summary of skipped files: count per reason plus up to 5 example paths.
@@ -467,6 +516,13 @@ pub(crate) fn clean(s: &str) -> String {
         .map(|c| match c {
             '\t' => ' ',
             c if c.is_control() => '?',
+            // Invisible/bidi-override characters that can spoof what a line says.
+            '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{061C}'
+            | '\u{FEFF}' => '?',
             c => c,
         })
         .collect()
@@ -501,6 +557,37 @@ mod tests {
         let s = snippet("a\tb\n\x1b[31mred\nc\nd");
         assert_eq!(s, "    a b\n    ?[31mred\n    c");
         assert!(snippet(&"x".repeat(500)).len() == 104);
+    }
+
+    #[test]
+    fn clean_scrubs_spoofing_characters() {
+        for c in [
+            '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}',
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{FEFF}', '\x1b', '\u{7f}', '\u{85}',
+        ] {
+            assert_eq!(clean(&format!("a{c}b")), "a?b", "{:x}", c as u32);
+        }
+        assert_eq!(clean("a\tb h\u{e9}llo"), "a b h\u{e9}llo");
+    }
+
+    #[test]
+    fn symlinked_gitignore_yields_a_warning_and_is_untouched() {
+        #[cfg(unix)]
+        {
+            let d = tempfile::tempdir().unwrap();
+            let target = d.path().join("real");
+            std::fs::write(&target, "x\n").unwrap();
+            let root = d.path().join("p");
+            std::fs::create_dir(&root).unwrap();
+            std::os::unix::fs::symlink(&target, root.join(".gitignore")).unwrap();
+            let w = gitignore_warning(&root).expect("warning");
+            assert!(
+                w.starts_with("pith: warning: could not update .gitignore"),
+                "{w}"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "x\n");
+        }
     }
 
     #[test]

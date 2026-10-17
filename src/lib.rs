@@ -12,7 +12,7 @@ pub mod mcp;
 pub mod storage;
 
 pub use commands::{
-    index_project, is_yes, load_default_embedder, now, open_project, render_search, render_stats,
-    search_project, skip_summary, stats_project, IndexReport, SearchHit, Stats,
+    index_project, is_yes, load_default_embedder, open_project, render_error, render_search,
+    render_stats, search_project, skip_summary, stats_project, IndexReport, SearchHit, Stats,
 };
 pub use error::{Error, Result};

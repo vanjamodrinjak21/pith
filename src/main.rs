@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use pithdb::embed::{models_dir, pull, DEFAULT_MODEL};
 use pithdb::{
-    index_project, is_yes, load_default_embedder, now, open_project, render_search, render_stats,
-    search_project, skip_summary, stats_project, Error, Result,
+    index_project, is_yes, load_default_embedder, open_project, render_error, render_search,
+    render_stats, search_project, skip_summary, stats_project, Error, Result,
 };
 use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -143,7 +143,14 @@ fn run(cli: Cli) -> Result<()> {
             let (root, db) = open_project(&std::env::current_dir()?)?;
             let embedder = load_default_embedder()?;
             let hits = search_project(&root, &db, embedder.as_ref(), &query, k)?;
-            print!("{}", render_search(&hits, db.meta().indexed_at_unix, now()));
+            print!(
+                "{}",
+                render_search(
+                    &hits,
+                    db.meta().indexed_at_unix,
+                    pithdb::commands::unix_now()
+                )
+            );
             Ok(())
         }
         Command::Stats => {
@@ -157,12 +164,7 @@ fn run(cli: Cli) -> Result<()> {
 
 fn main() {
     if let Err(e) = run(Cli::parse()) {
-        match e {
-            Error::Locked => eprintln!(
-                "pith: another pith process is writing this index; wait for it to finish and retry"
-            ),
-            e => eprintln!("pith: {e}"),
-        }
+        eprintln!("pith: {}", render_error(&e));
         std::process::exit(1);
     }
 }

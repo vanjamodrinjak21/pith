@@ -156,13 +156,14 @@ fn git(dir: &Path, args: &[&str]) {
 
 #[test]
 fn index_sets_git_head_only_in_git_repos() {
-    if Command::new("git").arg("--version").output().is_err() {
-        eprintln!("skipping index_sets_git_head_only_in_git_repos: git not found");
-        return;
-    }
+    // The non-git half is always asserted; only the git half needs the git binary.
     let plain = project();
     index_project(plain.path(), &FakeEmbedder, false).unwrap();
     assert_eq!(open(plain.path()).1.meta().git_head, None);
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git half of index_sets_git_head_only_in_git_repos skipped: git not found");
+        return;
+    }
 
     let repo = project();
     git(repo.path(), &["init", "-q"]);
@@ -320,18 +321,19 @@ fn second_writer_fails_fast_with_locked() {
 #[test]
 fn unreadable_existing_index_reports_the_io_error_not_corruption() {
     use std::os::unix::fs::PermissionsExt;
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipping unreadable_existing_index test: running as root ignores mode bits");
+        return;
+    }
     let d = project();
     index_project(d.path(), &FakeEmbedder, false).unwrap();
     let p = d.path().join(".pith");
     fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
     let r = index_project(d.path(), &FakeEmbedder, false);
     fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
-    match r {
-        Err(Error::Io(_)) => {}
-        // Running as root ignores the mode bits.
-        Ok(_) => {}
-        Err(e) => panic!("expected Io, got {e}"),
-    }
+    let e = r.unwrap_err();
+    assert!(matches!(e, Error::Io(_)), "{e}");
+    assert!(!e.to_string().contains("--reindex"), "{e}");
 }
 
 fn tampered_db(root: &Path, model: &str, head: &str) {
@@ -418,4 +420,57 @@ fn real_model_smoke() {
     for h in search_project(&root, &db, embedder.as_ref(), "mmap vector index", 5).unwrap() {
         eprintln!("{:.2} {}:{}-{}", h.score, h.path, h.start_line, h.end_line);
     }
+}
+
+#[test]
+fn file_as_root_keeps_the_not_a_directory_error() {
+    let d = project();
+    for reindex in [false, true] {
+        let e = index_project(&d.path().join("a.rs"), &FakeEmbedder, reindex).unwrap_err();
+        assert!(
+            matches!(e, Error::Invalid(ref m) if m.contains("is not a directory")),
+            "{e}"
+        );
+    }
+}
+
+#[test]
+fn lock_file_is_gitignored_even_when_indexing_fails() {
+    let d = project();
+    tampered_db(d.path(), "other-model", &"a".repeat(40));
+    fs::write(d.path().join(".gitignore"), "target/\n").unwrap();
+    let e = index_project(d.path(), &FakeEmbedder, false).unwrap_err();
+    assert!(matches!(e, Error::ModelMismatch { .. }));
+    let g = fs::read_to_string(d.path().join(".gitignore")).unwrap();
+    assert!(g.lines().any(|l| l == ".pith.lock"), "{g}");
+}
+
+#[cfg(unix)]
+#[test]
+fn error_messages_with_escape_bytes_in_paths_are_scrubbed() {
+    let d = tempfile::tempdir().unwrap();
+    let evil = d.path().canonicalize().unwrap().join("x\x1b[2Jy");
+    fs::create_dir(&evil).unwrap();
+    for args in [
+        vec!["stats"],
+        vec!["search", "q"],
+        vec!["index", "nonexistent\x1b[2J"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pith"))
+            .args(&args)
+            .current_dir(&evil)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            !out.stdout.contains(&0x1b) && !out.stderr.contains(&0x1b),
+            "{args:?}"
+        );
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_pith"))
+        .arg("stats")
+        .current_dir(&evil)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("x?[2Jy"));
 }
