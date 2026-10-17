@@ -9,3 +9,15 @@ keywords = ["vector-database", "embeddings", "onnx", "search"]
 categories = ["database-implementations"]
 
 [dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+thiserror = "2.0.21"
+
+[[bin]]
+name = "pith"
+path = "src/main.rs"
+
+[features]
+default = ["onnx", "mcp"]
+# Heavy deps (ort, tokenizers / rmcp, tokio) become optional members of these in later tasks.
+onnx = []
+mcp = []
