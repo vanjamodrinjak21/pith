@@ -4,6 +4,14 @@
 //! `.pithignore` (never the global gitignore, never parent directories). Dot-files and
 //! dot-directories are walked on purpose so the secrets deny list, not the walker's
 //! hidden-file filter, decides what is excluded; `.git` itself is never entered.
+//!
+//! Limits, stated plainly. The PEM content check is header-only: raw base64 or DER keys
+//! without a header are not detected by content (DER is binary and skipped as such).
+//! Unicode-confusable file names are not normalized; they are different names from the
+//! real secret names, so they are not a bypass. On non-unix targets (best effort) files
+//! are opened without `O_NOFOLLOW`, without a file-identity check and without the
+//! resolved-path check; only the walk-time symlink skip applies, so the race guarantee
+//! documented on [`collect`] is weaker there.
 
 mod chunk;
 mod deny;

@@ -23,10 +23,16 @@ const SNIFF_BYTES: u64 = 8 * 1024;
 /// that is inside a secrets directory (`~/.ssh`, `.gnupg`, `.aws`, ...) is refused.
 ///
 /// Files are opened with `O_NOFOLLOW | O_NONBLOCK` and the open handle must be the same
-/// regular file (device and inode) the walk saw. Residual risk: an intermediate
-/// directory swapped for a symlink mid-walk is not detected by that check; the
-/// mitigation is that only paths under the root are produced by the walk, and an
-/// attacker able to race the project tree can already edit the files directly.
+/// regular file (device and inode) the walk saw. After the open, the real path of the
+/// OPEN handle is resolved (`/proc/self/fd/N` on Linux, `F_GETPATH` on macOS) and must
+/// lie inside the canonical root; the deny list, including every directory rule, is
+/// re-run on that resolved root-relative path before any content is read. So a directory
+/// swapped for a symlink mid-walk cannot leak files from outside the root or from a
+/// denied directory. What remains: a swap within the root to a non-denied file is
+/// harmless, and on unix platforms with neither mechanism the file is skipped (fail
+/// closed). On non-unix targets (best effort) there is no `O_NOFOLLOW`, no file-identity
+/// check and no resolved-path check; only the walk-time symlink skip applies, so the
+/// race guarantee is weaker there.
 ///
 /// Memory: all chunks of the project are held in the returned report, which is
 /// acceptable for this slice (files are capped at [`MAX_FILE_BYTES`]).
@@ -81,9 +87,14 @@ pub fn collect(root: &Path) -> Result<CollectReport> {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
-                let path = err_path(&err)
-                    .map(|p| rel_string(p.strip_prefix(root).unwrap_or(&p)))
-                    .unwrap_or_else(|| err.to_string());
+                // Keys are never free-form text; the message travels in the reason.
+                let path = err_path(&err).map_or_else(
+                    || "<walk error>".to_owned(),
+                    |p| {
+                        p.strip_prefix(root)
+                            .map_or_else(|_| "<outside root>".to_owned(), rel_string)
+                    },
+                );
                 report
                     .skipped
                     .push((path, SkipReason::Unreadable(err.to_string())));
@@ -97,10 +108,10 @@ pub fn collect(root: &Path) -> Result<CollectReport> {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(root) else {
-            let p = entry.path().display().to_string();
-            report
-                .skipped
-                .push((p, SkipReason::Unreadable("path outside root".into())));
+            report.skipped.push((
+                "<outside root>".into(),
+                SkipReason::Unreadable("path outside root".into()),
+            ));
             continue;
         };
         if rel.as_os_str().is_empty() {
@@ -139,7 +150,7 @@ pub fn collect(root: &Path) -> Result<CollectReport> {
                 continue;
             }
         };
-        match read_text(entry.path(), &walked) {
+        match read_text(entry.path(), &walked, &canonical) {
             Ok(text) => {
                 let chunks: Vec<_> = chunk_text(&rel_str, &text)
                     .into_iter()
@@ -196,9 +207,42 @@ fn open_nofollow(path: &Path) -> std::io::Result<File> {
     o.open(path)
 }
 
+/// Real path of an open file, from the handle rather than the name.
+#[cfg(unix)]
+fn handle_path(file: &File) -> std::io::Result<PathBuf> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = rustix::fs::getpath(file)?;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(c.to_bytes())))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        use std::os::fd::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+}
+
+/// The resolved path must be inside the canonical root and not denied there.
+fn verify_resolved(resolved: &Path, canonical_root: &Path) -> std::result::Result<(), SkipReason> {
+    let Ok(rel) = resolved.strip_prefix(canonical_root) else {
+        return Err(SkipReason::Unreadable(
+            "resolved path escapes the root".into(),
+        ));
+    };
+    if deny::is_denied(rel) {
+        return Err(SkipReason::Denied);
+    }
+    Ok(())
+}
+
 /// `walked` is the `symlink_metadata` taken during the walk; the open handle must be
-/// the same regular file.
-fn read_text(path: &Path, walked: &Metadata) -> std::result::Result<String, SkipReason> {
+/// the same regular file, and its resolved path must pass the deny check again.
+fn read_text(
+    path: &Path,
+    walked: &Metadata,
+    canonical_root: &Path,
+) -> std::result::Result<String, SkipReason> {
     let unreadable = |e: std::io::Error| SkipReason::Unreadable(e.to_string());
     let file = open_nofollow(path).map_err(unreadable)?;
     let meta = file.metadata().map_err(unreadable)?;
@@ -212,8 +256,14 @@ fn read_text(path: &Path, walked: &Metadata) -> std::result::Result<String, Skip
             return Err(SkipReason::Unreadable("file changed during walk".into()));
         }
     }
+    #[cfg(unix)]
+    {
+        let resolved = handle_path(&file)
+            .map_err(|e| SkipReason::Unreadable(format!("cannot resolve open file: {e}")))?;
+        verify_resolved(&resolved, canonical_root)?;
+    }
     #[cfg(not(unix))]
-    let _ = walked;
+    let _ = (walked, canonical_root, verify_resolved);
     if meta.len() > MAX_FILE_BYTES {
         return Err(SkipReason::TooLarge);
     }
@@ -266,7 +316,7 @@ mod tests {
         let walked = std::fs::symlink_metadata(&f).unwrap();
         std::fs::remove_file(&f).unwrap();
         symlink(&target, &f).unwrap();
-        let r = read_text(&f, &walked);
+        let r = read_text(&f, &walked, &d.path().canonicalize().unwrap());
         assert!(matches!(r, Err(SkipReason::Unreadable(_))), "{r:?}");
     }
 
@@ -279,9 +329,81 @@ mod tests {
         let walked = std::fs::symlink_metadata(&f).unwrap();
         std::fs::rename(&other, &f).unwrap(); // other's inode is distinct from the walked one
         assert_eq!(
-            read_text(&f, &walked),
+            read_text(&f, &walked, &d.path().canonicalize().unwrap()),
             Err(SkipReason::Unreadable("file changed during walk".into()))
         );
+    }
+
+    /// Swap directory `project/<dir>` for a symlink to `target_dir`, where `hardlink`
+    /// (inside `target_dir`) shares the walked file's inode so only the resolved-path
+    /// check can catch it.
+    fn swap_dir_for_link(root: &Path, dir: &str, target_dir: &Path) -> (PathBuf, Metadata) {
+        let f = root.join(dir).join("f.txt");
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::fs::write(&f, "walked\n").unwrap();
+        let walked = std::fs::symlink_metadata(&f).unwrap();
+        std::fs::create_dir_all(target_dir).unwrap();
+        std::fs::hard_link(&f, target_dir.join("f.txt")).unwrap();
+        std::fs::rename(root.join(dir), root.join(format!("{dir}_old"))).unwrap();
+        symlink(target_dir, root.join(dir)).unwrap();
+        (f, walked)
+    }
+
+    #[test]
+    fn directory_swapped_for_outside_symlink_does_not_leak() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let (f, walked) = swap_dir_for_link(
+            &root,
+            "sub",
+            &d.path().canonicalize().unwrap().join("outside"),
+        );
+        let r = read_text(&f, &walked, &root);
+        assert!(
+            matches!(&r, Err(SkipReason::Unreadable(m)) if m.contains("escapes")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn directory_swapped_for_denied_in_root_dir_is_denied() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let (f, walked) = swap_dir_for_link(&root, "sub", &root.join(".ssh"));
+        assert_eq!(read_text(&f, &walked, &root), Err(SkipReason::Denied));
+    }
+
+    #[test]
+    fn directory_swapped_within_root_to_ordinary_dir_is_harmless() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let (f, walked) = swap_dir_for_link(&root, "sub", &root.join("other"));
+        assert_eq!(read_text(&f, &walked, &root).unwrap(), "walked\n");
+    }
+
+    #[test]
+    fn verify_resolved_checks_root_and_deny_list() {
+        let root = Path::new("/r/project");
+        assert!(verify_resolved(Path::new("/r/project/src/a.rs"), root).is_ok());
+        assert_eq!(
+            verify_resolved(Path::new("/r/project/.env"), root),
+            Err(SkipReason::Denied)
+        );
+        assert_eq!(
+            verify_resolved(Path::new("/r/project/a/.aws/x"), root),
+            Err(SkipReason::Denied)
+        );
+        assert!(matches!(
+            verify_resolved(Path::new("/r/outside/a.rs"), root),
+            Err(SkipReason::Unreadable(_))
+        ));
+        assert!(matches!(
+            verify_resolved(Path::new("/r/projectx/a.rs"), root),
+            Err(SkipReason::Unreadable(_))
+        ));
     }
 
     #[test]
@@ -290,7 +412,12 @@ mod tests {
         let f = d.path().join("f.txt");
         std::fs::write(&f, "hi\n").unwrap();
         assert_eq!(
-            read_text(&f, &std::fs::symlink_metadata(&f).unwrap()).unwrap(),
+            read_text(
+                &f,
+                &std::fs::symlink_metadata(&f).unwrap(),
+                &d.path().canonicalize().unwrap()
+            )
+            .unwrap(),
             "hi\n"
         );
     }

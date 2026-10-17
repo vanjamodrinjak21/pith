@@ -1,5 +1,10 @@
 //! Secrets deny list. Pure path matching, so it runs before any file is opened.
 //!
+//! Content is not inspected here (see `walk.rs` for the PEM header check). That check is
+//! header-only: raw base64 or DER keys without a header are not detected by content (DER
+//! is binary and skipped as such). Unicode-confusable file names are not normalized: they
+//! are different file names from the real secret names, so they are not a bypass.
+//!
 //! Names are matched case-insensitively with trailing dots and spaces trimmed
 //! (Windows ignores them, so `server.pem.` is `server.pem`).
 
@@ -36,11 +41,10 @@ const SOURCE_EXT: [&str; 18] = [
     "txt", "toml", "yaml", "yml",
 ];
 /// `(directory, file)` pairs, matched on consecutive components.
-const DENIED_PAIRS: [(&str, &str); 3] = [
-    (".aws", "credentials"),
-    (".docker", "config.json"),
-    (".kube", "config"),
-];
+const DENIED_PAIRS: [(&str, &str); 1] = [(".docker", "config.json")];
+/// Directories denied wholesale: `.aws/config` and `.aws/sso/cache/*` hold tokens, and
+/// `.kube/config.yaml` is a kubeconfig under a common name.
+const DENIED_DIRS: [&str; 4] = [".ssh", ".gnupg", ".aws", ".kube"];
 /// A project root inside one of these directories is refused outright.
 const SENSITIVE_ROOTS: [&str; 5] = [".ssh", ".gnupg", ".aws", ".docker", ".kube"];
 
@@ -61,13 +65,13 @@ fn lower_components(p: &Path) -> Vec<String> {
 }
 
 fn dir_denied(parts: &[String]) -> bool {
-    parts.iter().any(|c| c == ".ssh" || c == ".gnupg")
+    parts.iter().any(|c| DENIED_DIRS.contains(&c.as_str()))
 }
 
 /// Strips editor and backup decorations until none are left: `#x#`, trailing `~`,
-/// the backup suffixes, and numeric suffixes of 1 to 3 digits (`credentials.1`).
-/// Numeric suffixes only matter when what remains is an exact secret name, so ordinary
-/// names such as `config.v2.json` (which do not end in digits) are untouched.
+/// the backup suffixes, and all-digit suffixes of 1 to 14 digits (`credentials.1`,
+/// `secrets.yaml.1697500000`, `credentials.20261017`). Numeric suffixes only matter when
+/// what remains is an exact secret name, so `config.v2.json` and `config.v2` are untouched.
 fn normalize_name(n: &str) -> String {
     let mut s = n;
     loop {
@@ -78,7 +82,10 @@ fn normalize_name(n: &str) -> String {
         } else if let Some(t) = BACKUP_SUFFIXES.iter().find_map(|x| s.strip_suffix(x)) {
             s = t;
         } else if let Some((t, d)) = s.rsplit_once('.') {
-            if t.is_empty() || d.is_empty() || d.len() > 3 || !d.bytes().all(|b| b.is_ascii_digit())
+            if t.is_empty()
+                || d.is_empty()
+                || d.len() > 14
+                || !d.bytes().all(|b| b.is_ascii_digit())
             {
                 return s.to_owned();
             }
@@ -99,6 +106,15 @@ fn variants(n: &str) -> Vec<String> {
     v
 }
 
+/// An `env` segment after the first (`prod.env.yaml`) denies the file, except the
+/// `.example` / `.sample` / `.template` forms (`app.env.example`).
+fn env_segment_denied(segs: &[&str]) -> bool {
+    let Some(i) = segs.iter().skip(1).position(|s| *s == "env").map(|i| i + 1) else {
+        return false;
+    };
+    !(i + 2 == segs.len() && ["example", "sample", "template"].contains(&segs[i + 1]))
+}
+
 /// Rules on one normalized name.
 fn name_denied(n: &str) -> bool {
     if SAFE_ENV.contains(&n) {
@@ -116,11 +132,13 @@ fn name_denied(n: &str) -> bool {
     } else {
         ""
     };
-    let pubkey = n.ends_with(".pub");
+    // Only real key-pair names (`id_rsa.pub`) get the public-key allowance.
+    let pubkey = n.ends_with(".pub") && KEY_PREFIXES.iter().any(|p| n.starts_with(p));
     // Never softened by a source extension: `.env.yaml`, `id_rsa.txt`, `x.tfvars.yaml`.
     if n.starts_with(".env.")
         || n.ends_with(".env")
         || DENIED_EXT.contains(&last)
+        || env_segment_denied(&segs)
         || segs
             .iter()
             .skip(1)
@@ -268,12 +286,23 @@ mod tests {
     }
 
     #[test]
+    fn whole_aws_and_kube_dirs_are_denied() {
+        for p in [
+            ".aws/config",
+            ".aws/sso/cache/x.json",
+            ".kube/config.yaml",
+            ".kube/config.rs",
+        ] {
+            assert!(is_denied(Path::new(p)), "{p}");
+        }
+        assert!(is_denied_dir(Path::new("a/.kube")));
+    }
+
+    #[test]
     fn known_source_names_stay_allowed() {
         for n in SOURCE_NAMES {
             assert!(!is_denied(Path::new(n)), "{n}");
-            for d in [".kube", ".docker", ".aws"] {
-                assert!(!is_denied(&Path::new(d).join(n)), "{d}/{n}");
-            }
+            assert!(!is_denied(&Path::new(".docker").join(n)), ".docker/{n}");
         }
     }
 }

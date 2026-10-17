@@ -115,7 +115,7 @@ fn unreadable_file_is_skipped_not_fatal() {
     use std::os::unix::fs::PermissionsExt;
     let d = tempfile::tempdir().unwrap();
     if is_root() {
-        eprintln!("skipped: running as root, chmod 000 does not block reads");
+        eprintln!("SKIPPED (running as root): unreadable_file_is_skipped_not_fatal");
         return;
     }
     write(d.path(), "locked.txt", "x\n");
@@ -369,7 +369,6 @@ fn deny_table() {
         "secrets.rs",
         "secrets_test.py",
         "service_accounts.rs",
-        ".kube/other.yaml",
         ".docker/Dockerfile",
         "config",
         "docs/aws/credentials.md",
@@ -481,7 +480,7 @@ fn fifo_is_not_opened_and_is_recorded() {
 fn unreadable_directory_is_reported_with_its_path() {
     use std::os::unix::fs::PermissionsExt;
     if is_root() {
-        eprintln!("skipped: running as root, chmod 000 does not block reads");
+        eprintln!("SKIPPED (running as root): unreadable_directory_is_reported_with_its_path");
         return;
     }
     let d = tempfile::tempdir().unwrap();
