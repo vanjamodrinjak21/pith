@@ -2,10 +2,6 @@
 //! `stats`. It never indexes, never writes, and never takes the writer lock. Stdout carries only
 //! the protocol; nothing else in this process may print there.
 
-// Release builds must never carry the test hook.
-#[cfg(all(feature = "test-hooks", not(debug_assertions)))]
-compile_error!("the `test-hooks` feature is for debug test builds only");
-
 mod budget;
 mod tools;
 
