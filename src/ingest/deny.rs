@@ -6,7 +6,7 @@
 use std::path::{Component, Path};
 
 const SAFE_ENV: [&str; 3] = [".env.example", ".env.sample", ".env.template"];
-/// Denied when ANY dot-separated segment after the first matches (`server.pem.bak`).
+/// Final extensions that are secret key material (`server.pem`, `tls.key`).
 const DENIED_EXT: [&str; 8] = ["pem", "key", "p12", "pfx", "jks", "keystore", "kdbx", "ppk"];
 const KEY_PREFIXES: [&str; 4] = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
 const DENIED_NAMES: [&str; 12] = [
@@ -25,8 +25,19 @@ const DENIED_NAMES: [&str; 12] = [
 ];
 /// A denied name plus one of these is a backup of a secret (`credentials.bak`);
 /// `credentials.rs` is source and stays indexed.
-const BACKUP_SUFFIXES: [&str; 9] = [
-    ".bak", ".old", ".orig", ".save", ".backup", ".tmp", ".swp", ".copy", "~",
+const BACKUP_SUFFIXES: [&str; 10] = [
+    ".bak", ".old", ".orig", ".save", ".backup", ".tmp", ".swp", ".copy", ".dist", "~",
+];
+/// Final extensions of backups / temp copies; with a denied extension before them
+/// (`server.pem.bak`, `key.pfx.old`) the file is denied.
+const BACKUP_EXT: [&str; 9] = [
+    "bak", "old", "orig", "save", "backup", "tmp", "swp", "copy", "dist",
+];
+/// Source and document extensions: a secret-looking name part alone (`api.key.ts`,
+/// `id_rsa_helper.ts`) does not deny these. Exact secret names still do.
+const SOURCE_EXT: [&str; 18] = [
+    "ts", "tsx", "js", "mjs", "rs", "py", "go", "swift", "kt", "java", "c", "h", "cpp", "md",
+    "txt", "toml", "yaml", "yml",
 ];
 /// `(directory, file)` pairs, matched on consecutive components.
 const DENIED_PAIRS: [(&str, &str); 3] = [
@@ -71,14 +82,32 @@ fn name_denied(n: &str) -> bool {
     {
         return true;
     }
+    let trimmed = n.trim_end_matches('~');
+    let segs: Vec<&str> = trimmed.split('.').collect();
+    let last = if segs.len() > 1 {
+        segs[segs.len() - 1]
+    } else {
+        ""
+    };
+    if SOURCE_EXT.contains(&last) {
+        return false;
+    }
     if KEY_PREFIXES.iter().any(|p| n.starts_with(p)) && !n.ends_with(".pub") {
         return true;
     }
+    // Earlier segments only count when the name ends in a backup suffix.
+    let earlier_denied = segs.len() > 2
+        && segs[1..segs.len() - 1]
+            .iter()
+            .any(|s| DENIED_EXT.contains(s));
     n.starts_with(".env.")
         || n.ends_with(".env")
-        || n.split('.')
+        || DENIED_EXT.contains(&last)
+        || (BACKUP_EXT.contains(&last) && earlier_denied)
+        || segs
+            .iter()
             .skip(1)
-            .any(|seg| DENIED_EXT.contains(&seg) || seg == "tfvars" || seg.starts_with("tfstate"))
+            .any(|seg| *seg == "tfvars" || seg.starts_with("tfstate"))
 }
 
 /// True when `rel_path` (relative to the project root) must never be read or indexed.
