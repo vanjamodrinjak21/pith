@@ -1,4 +1,6 @@
-//! Exact cosine index: int8 SIMD scan to a candidate set, then f32 rescoring.
+//! Cosine index: an int8 SIMD scan selects the top `max(CANDIDATE_MULT * k, 32)` candidates,
+//! which are then rescored with f32 dot products. Not strictly exact: a true top-k vector
+//! could be lost in the int8 pass (recall is checked in tests/index_reference.rs).
 
 pub mod kernel;
 mod quant;
@@ -6,6 +8,19 @@ mod quant;
 use crate::{Error, Result};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+
+/// Candidates kept per requested hit during the int8 scan.
+const CANDIDATE_MULT: usize = 4;
+
+fn check_parts(dim: usize, full: &[f32]) -> Result<()> {
+    if full.iter().any(|x| !x.is_finite()) {
+        return Err(Error::NonFinite);
+    }
+    if dim > 0 && full.len() / dim > u32::MAX as usize {
+        return Err(Error::CorruptIndex("more than u32::MAX rows".into()));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hit {
@@ -31,7 +46,14 @@ impl VectorIndex {
                 got: v.len(),
             });
         }
+        if dim == 0 && !vectors.is_empty() {
+            return Err(Error::DimMismatch {
+                expected: 1,
+                got: 0,
+            });
+        }
         let full: Vec<f32> = vectors.into_iter().flatten().collect();
+        check_parts(dim, &full)?;
         let scale = quant::scale_for(&full);
         Ok(Self {
             dim,
@@ -51,6 +73,7 @@ impl VectorIndex {
                 full.len()
             )));
         }
+        check_parts(dim, &full)?;
         let scale = quant::scale_for(&full);
         Ok(Self {
             dim,
@@ -84,13 +107,28 @@ impl VectorIndex {
         &self.full
     }
 
-    /// Top `min(k, len)` hits by cosine, descending. Query must match `dim`.
+    /// Like [`try_search`](Self::try_search), but returns empty on a dimension
+    /// mismatch or a non-finite query.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<Hit> {
-        if self.is_empty() || k == 0 || query.len() != self.dim {
-            return Vec::new();
+        self.try_search(query, k).unwrap_or_default()
+    }
+
+    /// Top `min(k, len)` hits by cosine, descending (ties by ascending id).
+    pub fn try_search(&self, query: &[f32], k: usize) -> Result<Vec<Hit>> {
+        if self.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        if query.len() != self.dim {
+            return Err(Error::DimMismatch {
+                expected: self.dim,
+                got: query.len(),
+            });
+        }
+        if query.iter().any(|x| !x.is_finite()) {
+            return Err(Error::NonFinite);
         }
         let q8 = quant::quantize(query, self.scale);
-        let cap = (4 * k).max(32);
+        let cap = k.saturating_mul(CANDIDATE_MULT).max(32).min(self.len());
         // Min-heap of the best `cap` int8 scores.
         let mut heap: BinaryHeap<Reverse<(i32, u32)>> = BinaryHeap::with_capacity(cap + 1);
         for (id, row) in self.quantized.chunks_exact(self.dim).enumerate() {
@@ -114,6 +152,6 @@ impl VectorIndex {
             .collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
         hits.truncate(k);
-        hits
+        Ok(hits)
     }
 }

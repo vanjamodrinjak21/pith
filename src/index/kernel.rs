@@ -1,7 +1,7 @@
 //! int8 dot-product kernels. The only `unsafe` in the crate lives here.
 
 /// Portable reference kernel.
-pub fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
+pub(crate) fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
     assert_eq!(a.len(), b.len());
     a.iter().zip(b).map(|(&x, &y)| x as i32 * y as i32).sum()
 }
@@ -65,4 +65,49 @@ unsafe fn dot_avx2(a: &[i8], b: &[i8]) -> i32 {
     let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
     let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b10_11_00_01));
     _mm_cvtsi128_si32(s) + dot_i8_scalar(&a[n..], &b[n..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cases() -> Vec<(Vec<i8>, Vec<i8>)> {
+        let mut s: u64 = 42;
+        let mut gen = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 56) as u8 as i8
+        };
+        let mut out = vec![(vec![-128i8; 384], vec![-128i8; 384])];
+        for len in [0usize, 1, 7, 15, 16, 31, 32, 33, 100, 384, 385] {
+            for _ in 0..20 {
+                out.push((
+                    (0..len).map(|_| gen()).collect(),
+                    (0..len).map(|_| gen()).collect(),
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn simd_kernel_equals_scalar_kernel() {
+        for (a, b) in cases() {
+            let want = dot_i8_scalar(&a, &b);
+            assert_eq!(dot_i8(&a, &b), want);
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON is mandatory on aarch64; lengths are equal.
+            assert_eq!(unsafe { dot_neon(&a, &b) }, want, "neon len {}", a.len());
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: AVX2 verified at runtime; lengths are equal.
+                assert_eq!(unsafe { dot_avx2(&a, &b) }, want, "avx2 len {}", a.len());
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            println!("skipped: no avx2");
+        }
+    }
 }

@@ -5,6 +5,8 @@ pub enum Error {
     NotImplemented(&'static str),
     #[error("dimension mismatch: expected {expected}, got {got}")]
     DimMismatch { expected: usize, got: usize },
+    #[error("vector contains NaN or infinity")]
+    NonFinite,
     #[error("corrupt index: {0}")]
     CorruptIndex(String),
 }
