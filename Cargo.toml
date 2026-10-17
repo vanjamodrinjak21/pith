@@ -1,0 +1,11 @@
+[package]
+name = "pithdb"
+version = "0.0.1"
+edition = "2021"
+description = "Pith: lightweight embeddable vector database with built-in ONNX embeddings (name reservation, work in progress)"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["vector-database", "embeddings", "onnx", "search"]
+categories = ["database-implementations"]
+
+[dependencies]
