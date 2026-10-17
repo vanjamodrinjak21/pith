@@ -446,6 +446,8 @@ mod tests {
         for ok in [
             "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc?sig=1",
             "https://us.aws.cdn.hf.co/x",
+            "https://notarpa.com/m",
+            "https://mytest.com/m",
             "https://cdn-lfs.huggingface.co./x",
             "HTTPS://CDN.EXAMPLE.COM/m",
         ] {
