@@ -30,7 +30,7 @@ fn locate(start: &Path, home: Option<&Path>, owner: Option<u32>) -> Option<PathB
         if trusted(&candidate, owner) {
             return Some(candidate);
         }
-        if home.is_none_or(|h| dir == h) || dir.join(".git").exists() {
+        if home.is_none_or(|h| dir == h) || dir.join(".git").symlink_metadata().is_ok() {
             return None;
         }
     }

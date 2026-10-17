@@ -1,4 +1,5 @@
-//! int8 dot-product kernels. The only `unsafe` in the crate lives here.
+//! int8 dot-product kernels. Crate `unsafe` is limited to these SIMD kernels and
+//! the single mmap wrapper in `storage` (`map_readonly`).
 #![deny(unsafe_op_in_unsafe_fn)]
 
 fn sum_scalar(a: &[i8], b: &[i8]) -> i32 {

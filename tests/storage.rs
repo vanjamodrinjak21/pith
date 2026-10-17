@@ -395,10 +395,20 @@ fn decompression_is_bounded_by_stated_raw_length() {
     // Claims more than it holds.
     let m = corrupt_msg(&assemble(4, 0, &packed, raw.len() as u64 + 100));
     assert!(m.contains("header says"), "{m}");
-    // A bomb: 64 MiB of zeros in a tiny payload, stated as 16 bytes. Decoding stops
-    // after 17 bytes instead of inflating it.
+    // A bomb: 64 MiB of zeros in a tiny payload, stated as 16 bytes. As a normal
+    // frame its declared window is too large and it is refused before decoding.
     let bomb = zstd::bulk::compress(&vec![0u8; 64 << 20], 19).unwrap();
     assert!(bomb.len() < 64 << 10);
+    let m = corrupt_msg(&assemble(4, 0, &bomb, 16));
+    assert!(m.contains("too much memory"), "{m}");
+    // With the smallest window (1 KiB) it passes the window check; decoding then
+    // stops after 17 bytes instead of inflating it.
+    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 19).unwrap();
+    enc.window_log(10).unwrap();
+    enc.include_contentsize(false).unwrap();
+    std::io::Write::write_all(&mut enc, &vec![0u8; 64 << 20]).unwrap();
+    let bomb = enc.finish().unwrap();
+    assert!(bomb.len() < 8 << 20, "{}", bomb.len()); // small blocks compress less
     let m = corrupt_msg(&assemble(4, 0, &bomb, 16));
     assert!(m.contains("17+ bytes, header says 16"), "{m}");
 }
@@ -466,7 +476,12 @@ fn write_does_not_follow_planted_temp_symlink() {
     let path = dir.path().join(".pith");
     let victim = dir.path().join("victim");
     fs::write(&victim, b"keep").unwrap();
-    for name in [".pith.tmp", ".pith.tmp0", ".pith.tmp.tmp"] {
+    for name in [
+        ".pith.tmp",
+        ".pith.tmp0",
+        ".pith.tmp.tmp",
+        ".pith.tmpAbC123",
+    ] {
         std::os::unix::fs::symlink(&victim, dir.path().join(name)).unwrap();
     }
     write_sample(&path, 2);
@@ -475,6 +490,71 @@ fn write_does_not_follow_planted_temp_symlink() {
     assert!(fs::symlink_metadata(dir.path().join(".pith.tmp"))
         .unwrap()
         .is_symlink());
+    // The one matching the stale-temp pattern was removed (the link, not the target).
+    assert!(fs::symlink_metadata(dir.path().join(".pith.tmpAbC123")).is_err());
+}
+
+#[test]
+fn write_removes_stale_temp_files_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".pith");
+    let stale = [".pith.tmpXy12Zq", ".pith.tmp000000"];
+    let kept = [
+        ".pith.tmp",
+        ".pith.tmpshort",
+        ".pith.tmp1234567",
+        "notes.tmpAbC123",
+        ".pith.tmp-a_b.c",
+    ];
+    for n in stale.iter().chain(&kept) {
+        fs::write(dir.path().join(n), b"old").unwrap();
+    }
+    fs::create_dir(dir.path().join(".pith.tmpDIRDIR")).unwrap();
+    write_sample(&path, 1);
+    for n in stale {
+        assert!(!dir.path().join(n).exists(), "{n} not removed");
+    }
+    for n in kept.iter().chain(&[".pith.tmpDIRDIR"]) {
+        assert!(dir.path().join(n).exists(), "{n} removed");
+    }
+    // And the writer's own temp file is gone after a successful write.
+    let left: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| {
+            n.starts_with(".pith.tmp") && !kept.contains(&n.as_str()) && n != ".pith.tmpDIRDIR"
+        })
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn database_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".pith");
+    write_sample(&path, 1);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn oversized_zstd_window_refused() {
+    use std::io::Write;
+    let raw = table(0, 0, &[]);
+    // A frame that declares a 128 MiB window for a few bytes of content.
+    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    enc.window_log(27).unwrap();
+    enc.include_contentsize(false).unwrap();
+    enc.write_all(&raw).unwrap();
+    let packed = enc.finish().unwrap();
+    let m = corrupt_msg(&assemble(4, 0, &packed, raw.len() as u64));
+    assert!(m.starts_with("chunk section:"), "{m}");
+    // The same content with a normal frame opens.
+    assert!(open_bytes(&assemble_table(4, 0, &raw)).is_ok());
 }
 
 mod locate {
@@ -522,6 +602,15 @@ mod locate {
             locate_project_within(&deep, Some(&home)),
             Some(home.join(".pith"))
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dangling_git_symlink_stops_walk() {
+        let (_root, home, deep) = tree();
+        fs::write(home.join(".pith"), b"x").unwrap();
+        std::os::unix::fs::symlink(home.join("missing"), home.join("proj/.git")).unwrap();
+        assert_eq!(locate_project_within(&deep, Some(&home)), None);
     }
 
     #[test]

@@ -111,8 +111,8 @@ impl<W: Write> HashingWriter<W> {
     }
 }
 
-/// Streams the file to `w`. Only the compressed chunk table is buffered; vector
-/// sections are written straight from the index.
+/// Streams the file to `w`. The chunk table is buffered (raw, then compressed);
+/// the vector sections are written straight from the index without a copy.
 pub fn encode(
     w: impl Write,
     model_id: &str,
@@ -232,20 +232,22 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Decompresses at most `raw_len` bytes; more or fewer is corruption. Memory grows
-/// only with real output, so a small payload claiming a huge length cannot force
-/// a large allocation up front.
+/// Decompresses exactly `raw_len` bytes; more or fewer is corruption. The output
+/// buffer is reserved once at `raw_len + 1` (so at most `MAX_TABLE_RAW + 1`; a
+/// lying header can reserve up to that, which is virtual until written), and the
+/// decoder refuses frames whose window exceeds what `raw_len` needs.
 fn decompress_bounded(src: &[u8], raw_len: u64) -> Result<Vec<u8>> {
     if raw_len > MAX_TABLE_RAW {
         return Err(corrupt(format!("chunk table length {raw_len} over limit")));
     }
     let err = |e: std::io::Error| corrupt(format!("chunk section: {e}"));
-    let mut out = Vec::new();
-    zstd::stream::read::Decoder::new(src)
-        .map_err(err)?
-        .take(raw_len + 1)
-        .read_to_end(&mut out)
-        .map_err(err)?;
+    // Exact reservation (never above the cap); the +1 byte detects overlong output.
+    let mut out = Vec::with_capacity(raw_len as usize + 1);
+    // A frame needs no window larger than its content; refuse frames declaring more.
+    let window_log = (64 - raw_len.leading_zeros()).clamp(10, 31);
+    let mut dec = zstd::stream::read::Decoder::new(src).map_err(err)?;
+    dec.window_log_max(window_log).map_err(err)?;
+    dec.take(raw_len + 1).read_to_end(&mut out).map_err(err)?;
     if out.len() as u64 != raw_len {
         return Err(corrupt(format!(
             "chunk table decompressed to {}{} bytes, header says {raw_len}",

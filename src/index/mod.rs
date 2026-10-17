@@ -113,7 +113,7 @@ impl VectorIndex {
 
     /// A zero-copy index over `map[quantized]` (int8) and `map[full]` (f32, native
     /// endian, 4-byte aligned). Validated exactly like [`from_parts`](Self::from_parts).
-    pub fn from_mapped(
+    pub(crate) fn from_mapped(
         dim: usize,
         map: Arc<memmap2::Mmap>,
         quantized: Range<usize>,

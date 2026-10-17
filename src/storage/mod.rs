@@ -129,6 +129,29 @@ impl Db {
     }
 }
 
+const TEMP_RAND: usize = 6;
+
+/// Removes temp files left by a killed writer: `<prefix>` + exactly `TEMP_RAND`
+/// alphanumerics. Only called with the writer lock held, so none belongs to a live
+/// writer. A matching symlink is removed itself, never followed.
+fn remove_stale_temps(dir: &Path, prefix: &str) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(prefix)) else {
+            continue;
+        };
+        if !prefix.is_empty()
+            && rest.len() == TEMP_RAND
+            && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+            && !entry.file_type()?.is_dir()
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// `before_rename` runs after the temp file is synced; an error aborts the write.
 fn write_inner(
     path: &Path,
@@ -145,9 +168,15 @@ fn write_inner(
         .unwrap_or(Path::new("."));
     let mut prefix = path.file_name().unwrap_or_default().to_os_string();
     prefix.push(".tmp");
+    remove_stale_temps(dir, prefix.to_str().unwrap_or_default())?;
     // Random name created with O_EXCL, so a planted file or symlink is never
-    // followed. Deleted on drop, i.e. on every early return.
-    let tmp = tempfile::Builder::new().prefix(&prefix).tempfile_in(dir)?;
+    // followed. Deleted on drop, i.e. on every early return. tempfile creates it
+    // with mode 0600, which the database keeps after the rename: it holds source
+    // code, so it is deliberately readable by its owner only.
+    let tmp = tempfile::Builder::new()
+        .prefix(&prefix)
+        .rand_bytes(TEMP_RAND)
+        .tempfile_in(dir)?;
     format::encode(BufWriter::new(tmp.as_file()), model_id, chunks, index, meta)?;
     tmp.as_file().sync_all()?;
     before_rename()?;
