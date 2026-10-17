@@ -1,6 +1,7 @@
 //! Memory used by `Db::open` + a full search on 100k x 384: vectors must stay in
 //! the file mapping, not be copied to private memory.
-//! Run: `cargo test --release --test storage_heap -- --ignored --nocapture`.
+//! The 20k test runs in the default suite; the 100k test is ignored, run it with
+//! `cargo test --release --test storage_heap -- --ignored --nocapture`.
 //!
 //! Plain RSS (`ps -o rss=`) is printed but cannot be asserted on: it also counts
 //! clean file-backed pages of the mapping, which open's validation touches in full.

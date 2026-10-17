@@ -10,7 +10,7 @@
 //! 16   count            u32 number of chunks == number of vectors
 //! 20   reserved         u32 must be 0
 //! 24   chunks_len       u64 byte length of the compressed chunk section
-//! 32   table_raw_len    u64 decompressed length of the chunk table (<= table_raw_max(count))
+//! 32   table_raw_len    u64 decompressed length of the chunk table (see check_table_len)
 //! 40   hash_chunks      32  blake3 of the chunk section
 //! 72   hash_quant       32  blake3 of the int8 section
 //! 104  hash_f32         32  blake3 of the f32 section
@@ -33,7 +33,8 @@
 //! What `decode` validates, in order: minimum length, magic, version, header hash,
 //! reserved field, layout vs. real length, whole-file hash (so a flip of ANY byte,
 //! padding included, fails), per-section hashes, the chunk table decompressed with a
-//! hard bound (`table_raw_len`, itself capped) and parsed with bounds checks (must
+//! hard bound (`table_raw_len`, itself capped by the
+//! count, by `chunks_len * MAX_RATIO` and by a ceiling) and parsed with bounds checks (must
 //! be consumed exactly, hold `count` entries, UTF-8 strings), `dim > 0`,
 //! chunk count == vector count, and `VectorIndex::from_mapped` re-checks that the
 //! int8 data equals `quantize(f32)` and that all floats are finite.
@@ -63,15 +64,28 @@ const HASHED_HEADER: usize = 136;
 const HASHES_AT: usize = 40;
 /// Smallest valid file: header plus the trailing file hash.
 pub const MIN_LEN: usize = HEADER_LEN + 32;
-/// Upper bound for the decompressed chunk table.
-/// Per-chunk raw table budget: text of up to 1,400 chars (the chunker's limit) at
-/// up to 4 UTF-8 bytes each, plus 4,096 for the path and the 16 bytes of entry
-/// overhead: 1,400 * 4 + 4,096 = 9,696 bytes.
-pub const PER_CHUNK_MAX: u64 = 1_400 * 4 + 4_096;
-/// Model id, meta and git head share this.
+/// Per-chunk raw table budget, derived from the chunker's limit
+/// (`crate::CHUNK_MAX_CHARS` = 1,400 chars, up to 4 UTF-8 bytes each) plus 4,096
+/// bytes for the path and the 16 bytes of entry overhead:
+/// 1,400 * 4 + 4,096 = 9,696 bytes.
+///
+/// This is a total budget per chunk (`count * PER_CHUNK_MAX` for the whole table),
+/// not a per-field limit: a single path or text over its share is absorbed by the
+/// headroom of other, typically much smaller, chunks. Only when the whole table
+/// exceeds the bound does `Db::write` refuse it with `Error::Invalid`.
+pub const PER_CHUNK_MAX: u64 = crate::CHUNK_MAX_CHARS as u64 * 4 + 4_096;
+/// Model id, meta and git head share this; also the additive slack of the ratio bound.
 pub const TABLE_SLACK: u64 = 64 << 10;
-/// Last-resort ceiling regardless of count.
-pub const TABLE_RAW_CEILING: u64 = 8 << 30;
+/// Last-resort ceiling regardless of count: 4 GiB. The spec's scale is ~1M chunks;
+/// a typical chunk is ~1,400 ASCII bytes + ~100 path + 16 overhead, so 1M chunks
+/// is ~1.5e9 bytes < 4 GiB (4.29e9). Only pathological tables (e.g. 1M chunks of
+/// all-4-byte text, 1M * 9,696 = 9.7e9) hit it, and the writer refuses those.
+pub const TABLE_RAW_CEILING: u64 = 4 << 30;
+/// Largest raw/compressed ratio a file may declare. The count-derived bound alone is
+/// controlled by the (crafted) header, so the raw length is also bounded by bytes
+/// that really exist. zstd on highly repetitive text can exceed 100x, so the margin
+/// is generous; it still bounds a 1 MB file to about 1 GB.
+pub const MAX_RATIO: u64 = 1024;
 /// Decompression grows in steps of this size, each reserved fallibly.
 const GROW_BLOCK: usize = 1 << 20;
 
@@ -82,6 +96,36 @@ pub fn table_raw_max(count: u64) -> u64 {
         .and_then(|n| n.checked_add(TABLE_SLACK))
         .map_or(TABLE_RAW_CEILING, |n| n.min(TABLE_RAW_CEILING))
 }
+
+/// Largest raw chunk table `compressed_len` bytes of zstd may declare.
+pub fn table_ratio_max(compressed_len: u64) -> u64 {
+    compressed_len
+        .saturating_mul(MAX_RATIO)
+        .saturating_add(TABLE_SLACK)
+}
+
+/// The one bound shared by writer and reader, so the writer cannot produce a file
+/// that fails to open. Returns the reason on violation.
+fn check_table_len(
+    raw_len: u64,
+    compressed_len: u64,
+    count: u64,
+) -> std::result::Result<(), String> {
+    let max = table_raw_max(count);
+    if raw_len > max {
+        return Err(format!(
+            "chunk table length {raw_len} over limit {max} for {count} chunks"
+        ));
+    }
+    let max = table_ratio_max(compressed_len);
+    if raw_len > max {
+        return Err(format!(
+            "chunk table length {raw_len} over limit {max} for {compressed_len} compressed bytes"
+        ));
+    }
+    Ok(())
+}
+
 const ALIGN: usize = 64;
 /// Up-front decompression reservation per compressed byte (text rarely exceeds it).
 const RESERVE_RATIO: u64 = 64;
@@ -173,14 +217,11 @@ pub fn encode(
         table.extend_from_slice(&c.end_line.to_le_bytes());
         put_str(&mut table, &c.text)?;
     }
-    let max = table_raw_max(count as u64);
-    if table.len() as u64 > max {
-        return Err(Error::Invalid(format!(
-            "chunk table is {} bytes, over the {max} byte limit for {count} chunks",
-            table.len()
-        )));
-    }
+    // Cheap count check before compressing; the full check needs the packed size.
+    check_table_len(table.len() as u64, u64::MAX, count as u64).map_err(Error::Invalid)?;
     let packed = zstd::bulk::compress(&table, ZSTD_LEVEL)?;
+    check_table_len(table.len() as u64, packed.len() as u64, count as u64)
+        .map_err(Error::Invalid)?;
     let quant: &[u8] = bytemuck::cast_slice(index.quantized());
     let full: &[u8] = bytemuck::cast_slice(index.full()); // LE: big-endian is refused above
 
@@ -252,26 +293,40 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: (fail every reservation, largest capacity requested so far).
+    static RESERVE_HOOK: std::cell::Cell<(bool, usize)> = const { std::cell::Cell::new((false, 0)) };
+}
+
+/// Fallibly reserves room for `additional` more bytes.
+fn grow(out: &mut Vec<u8>, additional: usize) -> Result<()> {
+    let total = out.len() + additional;
+    let no_mem = || corrupt(format!("cannot reserve {total} bytes for chunk table"));
+    #[cfg(test)]
+    {
+        let (fail, max) = RESERVE_HOOK.get();
+        RESERVE_HOOK.set((fail, max.max(total)));
+        if fail {
+            return Err(no_mem());
+        }
+    }
+    out.try_reserve(additional).map_err(|_| no_mem())
+}
+
 /// Decompresses exactly `raw_len` bytes; more or fewer is corruption. Up front it
 /// reserves at most `compressed_len * RESERVE_RATIO + 4 KiB` (fallibly), so a lying
 /// header cannot force a large allocation; the decoder refuses frames whose window
 /// exceeds what `raw_len` needs.
 fn decompress_bounded(src: &[u8], raw_len: u64, count: u64) -> Result<Vec<u8>> {
-    let max = table_raw_max(count);
-    if raw_len > max {
-        return Err(corrupt(format!(
-            "chunk table length {raw_len} over limit {max} for {count} chunks"
-        )));
-    }
+    check_table_len(raw_len, src.len() as u64, count).map_err(corrupt)?;
     let err = |e: std::io::Error| corrupt(format!("chunk section: {e}"));
     // Reserve in proportion to the input, not the header's claim, and fallibly;
     // the buffer grows past that only as bytes are really produced (<= raw_len + 1,
     // the +1 detecting overlong output).
     let reserve = (raw_len + 1).min(src.len() as u64 * RESERVE_RATIO + 4096);
-    let no_mem = |n: u64| corrupt(format!("cannot reserve {n} bytes for chunk table"));
     let mut out = Vec::new();
-    out.try_reserve_exact(reserve as usize)
-        .map_err(|_| no_mem(reserve))?;
+    grow(&mut out, reserve as usize)?;
     // A frame needs no window larger than its content; refuse frames declaring more.
     let window_log = (64 - raw_len.leading_zeros()).clamp(10, 31);
     let mut dec = zstd::stream::read::Decoder::new(src).map_err(err)?;
@@ -285,8 +340,7 @@ fn decompress_bounded(src: &[u8], raw_len: u64, count: u64) -> Result<Vec<u8>> {
             break;
         }
         if out.capacity() - len < want {
-            out.try_reserve(want)
-                .map_err(|_| no_mem((len + want) as u64))?;
+            grow(&mut out, want)?;
         }
         out.resize(len + want, 0); // within capacity: cannot allocate
         let n = dec.read(&mut out[len..]).map_err(err)?;
@@ -416,6 +470,77 @@ fn check_counts(chunks: usize, index: &VectorIndex) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn packed() -> Vec<u8> {
+        zstd::bulk::compress(b"tiny", 3).unwrap()
+    }
+
+    /// Runs `f` with the reserve hook set to `fail`; returns its result and the
+    /// largest capacity requested.
+    fn hooked<T>(fail: bool, f: impl FnOnce() -> T) -> (T, usize) {
+        RESERVE_HOOK.set((fail, 0));
+        let r = f();
+        let (_, max) = RESERVE_HOOK.replace((false, 0));
+        (r, max)
+    }
+
+    #[test]
+    fn reservation_failure_is_clean_corruption() {
+        let p = packed();
+        let (r, _) = hooked(true, || decompress_bounded(&p, 4, 0));
+        match r {
+            Err(Error::CorruptDb(m)) => assert!(m.starts_with("cannot reserve 5 bytes"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        let (r, _) = hooked(false, || decompress_bounded(&p, 4, 0));
+        assert_eq!(r.unwrap(), b"tiny");
+    }
+
+    #[test]
+    fn header_claiming_the_maximum_fails_without_large_reservation() {
+        let p = packed();
+        for count in [0u64, 1, 1_000, u32::MAX as u64] {
+            let max = table_raw_max(count).min(table_ratio_max(p.len() as u64));
+            assert!(check_table_len(max, p.len() as u64, count).is_ok());
+            assert!(check_table_len(max + 1, p.len() as u64, count).is_err());
+            let (r, reserved) = hooked(false, || decompress_bounded(&p, max, count));
+            match r {
+                Err(Error::CorruptDb(m)) => {
+                    assert!(m.contains(&format!("4 bytes, header says {max}")), "{m}")
+                }
+                other => panic!("{other:?}"),
+            }
+            // Up front: proportional to the input; then at most one block ahead of
+            // the bytes really produced.
+            assert!(reserved <= 4 + GROW_BLOCK, "{reserved} for claim {max}");
+        }
+    }
+
+    #[test]
+    fn ratio_bound_rejects_before_decompressing() {
+        let p = packed();
+        let over = table_ratio_max(p.len() as u64) + 1;
+        let (r, reserved) = hooked(false, || decompress_bounded(&p, over, 1_000_000));
+        match r {
+            Err(Error::CorruptDb(m)) => assert!(
+                m.contains(&format!(
+                    "over limit {} for {} compressed bytes",
+                    over - 1,
+                    p.len()
+                )),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(reserved, 0, "reserved before the bound check");
+    }
+
+    #[test]
+    fn ceiling_is_4_gib() {
+        assert_eq!(TABLE_RAW_CEILING, 4 << 30);
+        assert_eq!(table_raw_max(u32::MAX as u64), 4 << 30);
+        assert_eq!(PER_CHUNK_MAX, 9_696);
+    }
 
     #[test]
     fn check_counts_rejects_mismatch() {
