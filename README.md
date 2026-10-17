@@ -6,7 +6,7 @@ network access is a one-time model download.
 
 > **The on-disk format is unstable until 1.0.** Any release before 1.0 may change it. Pith
 > refuses to open an index it does not understand; rebuild with `pith index --reindex`. Do not
-> treat `.pith/` as durable data: it is a cache of your source tree.
+> treat `.pith` as durable data: it is a cache of your source tree.
 
 Pith is `0.1`: indexing, search, stats and the MCP server work; there is no HNSW (search is an
 exact-ish brute-force scan, see Performance), no incremental indexing, and no non-code ingestion.
@@ -64,7 +64,7 @@ The model is loaded on the first search and dropped after 5 idle minutes.
 ## Performance
 
 Measured on an M4 Pro, release build. The search row is from this repo's bench. The embedding
-rows come from the Task 5 real-model test (`cargo test --release --test embed -- --ignored
+rows come from the ignored real-model embedding test (`cargo test --release --test embed -- --ignored
 --nocapture --test-threads=1`, 830-char chunks), not from `cargo bench`.
 
 | What | Result |
@@ -73,7 +73,7 @@ rows come from the Task 5 real-model test (`cargo test --release --test embed --
 | Embedding, batch 1, 8 threads, 830-char chunks | 43.5 chunks/s |
 | Embedding, batch 32, 8 threads | 45.4 chunks/s |
 | Embedding, batch 1, 4 threads / 1 thread | 33.3 / 15.5 chunks/s |
-| Indexing a copy of `src/` as of the Task 6 smoke test (134 chunks; the tree has changed since) | 3.2 s |
+| `pith index` on an early copy of this repo's `src/` (134 chunks) | 3.2 s |
 
 Embedding dominates: a 3,000-chunk repository takes about a minute to index. The batch 8/16/32/64
 and 1-8 thread grid in `cargo bench --bench index` is not measured yet (it needs the model
@@ -94,6 +94,9 @@ int8 pass.
 - Model download redirects are validated by host-name shape (https to a DNS name; no IP literals,
   `localhost`, `.local`, `.internal` and similar). No DNS lookup is made, so a public-looking
   host name that resolves to a private address is not blocked.
+- A `.pith` file is trusted as-is: its chunk text is shown next to real file paths, in search
+  output and to Claude through the MCP server. A `.pith` committed to a repository you clone is
+  used like your own. Do not commit `.pith` files, and do not use one from an untrusted source.
 - Unix only in practice: on platforms with neither `F_GETPATH` nor `/proc` (BSDs) every file is
   skipped as unreadable.
 

@@ -13,8 +13,9 @@ pub(crate) fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
     sum_scalar(a, b)
 }
 
-/// int8 dot product using the best SIMD path for this CPU.
-pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+/// int8 dot product using the best SIMD path for this CPU (tests check it against the scalar one).
+#[cfg(test)]
+pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     let mut out = 0;
     assert_eq!(a.len(), b.len());
     if a.is_empty() {

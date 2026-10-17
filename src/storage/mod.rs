@@ -17,6 +17,7 @@ mod locate;
 mod lock;
 
 pub use locate::{locate_project, locate_project_within};
+#[doc(hidden)]
 pub use lock::WriterLock;
 
 use crate::index::VectorIndex;
@@ -104,6 +105,9 @@ impl Db {
         index: &VectorIndex,
         meta: IndexMeta,
     ) -> Result<()> {
+        if let Some(m) = format::oversized(&chunks) {
+            return Err(Error::Invalid(m));
+        }
         write_inner(path, model_id, &chunks, index, &meta, || Ok(()))
     }
 
@@ -190,6 +194,50 @@ fn write_inner(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn oversized_chunks_are_refused_on_write_and_rejected_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        let index = VectorIndex::build(vec![vec![0.6, 0.8]]).unwrap();
+        let meta = IndexMeta {
+            indexed_at_unix: 0,
+            git_head: None,
+        };
+        for (path, text) in [
+            ("a".repeat(format::MAX_PATH_BYTES + 1), "t".to_string()),
+            ("a".to_string(), "t".repeat(format::MAX_TEXT_BYTES + 1)),
+        ] {
+            let chunks = vec![StoredChunk {
+                path,
+                start_line: 1,
+                end_line: 1,
+                text,
+            }];
+            let e = Db::write(&p, "m", chunks.clone(), &index, meta.clone()).unwrap_err();
+            assert!(matches!(e, Error::Invalid(_)), "{e:?}");
+            // Bypass the write check: decode must reject it as corrupt, not panic.
+            let mut f = File::create(&p).unwrap();
+            format::encode(&mut f, "m", &chunks, &index, &meta).unwrap();
+            drop(f);
+            let Err(e) = Db::open(&p, None) else {
+                panic!("opened")
+            };
+            assert!(
+                matches!(e, Error::CorruptDb(ref m) if m.contains("bytes (limit")),
+                "{e:?}"
+            );
+        }
+        // At the limits it round-trips.
+        let chunks = vec![StoredChunk {
+            path: "a".repeat(format::MAX_PATH_BYTES),
+            start_line: 1,
+            end_line: 1,
+            text: "t".repeat(format::MAX_TEXT_BYTES),
+        }];
+        Db::write(&p, "m", chunks, &index, meta).unwrap();
+        assert!(Db::open(&p, None).is_ok());
+    }
 
     #[test]
     fn map_readonly_matches_file_and_survives_replace_by_rename() {

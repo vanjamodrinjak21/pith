@@ -11,7 +11,9 @@ mod pull;
 pub use manifest::{Manifest, ModelFile, DEFAULT_MODEL};
 #[cfg(feature = "onnx")]
 pub use onnx::{OnnxConfig, OnnxEmbedder};
-pub use pull::{pull, pull_files};
+pub use pull::pull;
+#[doc(hidden)]
+pub use pull::pull_files;
 
 use crate::{Error, Result};
 use std::path::PathBuf;
@@ -59,6 +61,7 @@ fn normalize(v: &mut [f32]) -> Result<()> {
 }
 
 /// CLS pooling over a row-major `[batch, seq, dim]` hidden-state tensor, then L2 normalization.
+#[doc(hidden)]
 pub fn cls_pool_normalize(
     hidden: &[f32],
     batch: usize,
@@ -84,6 +87,7 @@ pub fn cls_pool_normalize(
 /// Deterministic hash-based 384-d embedder for tests. Always compiled (tiny, no deps beyond
 /// blake3) so integration tests and `--no-default-features` builds can use it.
 /// Queries embed exactly like passages, so a query equal to a passage scores 1.0.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FakeEmbedder;
 

@@ -1,4 +1,4 @@
-//! Pith: lightweight embeddable vector database. Work in progress.
+//! Pith: a local single-file vector database with built-in ONNX embeddings, for searching a codebase by meaning.
 
 /// Longest chunk the chunker emits, in chars; the storage table bound derives from it.
 pub(crate) const CHUNK_MAX_CHARS: usize = 1_400;

@@ -30,6 +30,7 @@ mod chunk;
 mod deny;
 mod walk;
 
+#[doc(hidden)]
 pub use deny::is_denied;
 pub use walk::{collect, MAX_FILE_BYTES};
 

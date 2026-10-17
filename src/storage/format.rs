@@ -69,15 +69,35 @@ pub const MIN_LEN: usize = HEADER_LEN + 32;
 /// bytes for the path and the 16 bytes of entry overhead:
 /// 1,400 * 4 + 4,096 = 9,696 bytes.
 ///
-/// This is a total budget per chunk (`count * PER_CHUNK_MAX` for the whole table),
-/// not a per-field limit: a single path or text over its share is absorbed by the
-/// headroom of other, typically much smaller, chunks. Only when the whole table
-/// exceeds the bound does `Db::write` refuse it with `Error::Invalid`. The ratio
-/// bound (`MAX_RATIO`) can also refuse a table with `Error::Invalid`.
-///
-/// `CHUNK_MAX_CHARS` is not enforced here: it will be enforced by the Task 4
-/// chunker, which does not exist yet. Until then this budget is only an estimate.
+/// The whole table is bounded by `count * PER_CHUNK_MAX` (plus a fixed allowance);
+/// over it, `Db::write` refuses with `Error::Invalid`, as it does for the ratio bound
+/// (`MAX_RATIO`). Each field is also bounded: `CHUNK_MAX_CHARS` is enforced by the
+/// chunker (`ingest::chunk`), and `decode` rejects (`Db::write` refuses) text over
+/// [`MAX_TEXT_BYTES`] or a path over [`MAX_PATH_BYTES`].
 pub const PER_CHUNK_MAX: u64 = crate::CHUNK_MAX_CHARS as u64 * 4 + 4_096;
+/// Longest stored chunk text, in bytes.
+pub const MAX_TEXT_BYTES: usize = crate::CHUNK_MAX_CHARS * 4;
+/// Longest stored path, in bytes.
+pub const MAX_PATH_BYTES: usize = 4_096;
+
+/// The first chunk whose path or text is over its per-field limit, described.
+pub fn oversized(chunks: &[StoredChunk]) -> Option<String> {
+    chunks.iter().enumerate().find_map(|(i, c)| {
+        if c.path.len() > MAX_PATH_BYTES {
+            Some(format!(
+                "chunk {i} path is {} bytes (limit {MAX_PATH_BYTES})",
+                c.path.len()
+            ))
+        } else if c.text.len() > MAX_TEXT_BYTES {
+            Some(format!(
+                "chunk {i} text is {} bytes (limit {MAX_TEXT_BYTES})",
+                c.text.len()
+            ))
+        } else {
+            None
+        }
+    })
+}
 /// Model id, meta and git head share this; also the additive slack of the ratio bound.
 pub const TABLE_SLACK: u64 = 64 << 10;
 /// Last-resort ceiling regardless of count: 4 GiB. The spec's scale is ~1M chunks;
@@ -445,6 +465,12 @@ pub fn decode(map: Arc<memmap2::Mmap>) -> Result<Decoded> {
     if dim == 0 {
         return Err(corrupt("dimension is 0"));
     }
+    if dim > crate::index::MAX_DIM {
+        return Err(corrupt(format!(
+            "dimension {dim} exceeds {}",
+            crate::index::MAX_DIM
+        )));
+    }
 
     let table = decompress_bounded(&b[ranges[0].clone()], raw_len, count as u64)?;
     let mut r = Reader(&table);
@@ -467,6 +493,9 @@ pub fn decode(map: Arc<memmap2::Mmap>) -> Result<Decoded> {
     }
     if !r.0.is_empty() {
         return Err(corrupt("trailing bytes in chunk table"));
+    }
+    if let Some(m) = oversized(&chunks) {
+        return Err(corrupt(m));
     }
     let [_, q, f] = ranges;
     let index =

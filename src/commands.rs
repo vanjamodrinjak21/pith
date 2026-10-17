@@ -48,6 +48,7 @@ pub struct Stats {
 }
 
 /// Seconds since the Unix epoch.
+#[doc(hidden)]
 pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -408,7 +409,7 @@ pub(crate) fn valid_head(h: &str) -> bool {
     matches!(h.len(), 40 | 64) && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-pub fn age(secs: u64) -> String {
+pub(crate) fn age(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs} seconds ago"),
         60..=3599 => format!("{} minutes ago", secs / 60),
@@ -418,7 +419,7 @@ pub fn age(secs: u64) -> String {
 }
 
 /// First 3 lines, each cut to 100 chars, indented, control characters scrubbed.
-pub fn snippet(text: &str) -> String {
+pub(crate) fn snippet(text: &str) -> String {
     text.lines()
         .take(3)
         .map(|l| format!("    {}", clean(&l.chars().take(100).collect::<String>())))

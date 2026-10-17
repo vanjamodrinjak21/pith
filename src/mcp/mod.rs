@@ -5,8 +5,6 @@
 mod budget;
 mod tools;
 
-pub use budget::fit_budget;
-
 use crate::embed::Embedder;
 use crate::storage::{locate_project, Db};
 use crate::{Error, Result};
@@ -23,8 +21,20 @@ const MAX_LINE: usize = 1 << 20;
 
 type Loaded = Box<dyn Embedder + Send>;
 
-/// Database identity: a reindex replaces the file, so path, size or mtime change.
-type DbKey = (PathBuf, u64, Option<SystemTime>);
+/// Database identity: a reindex renames a new file into place, so the inode (unix) changes even
+/// when size and mtime match. Elsewhere (dev, ino) is (0, 0) and path, size, mtime decide.
+type DbKey = (PathBuf, u64, Option<SystemTime>, (u64, u64));
+
+#[cfg(unix)]
+fn file_id(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+
+#[cfg(not(unix))]
+fn file_id(_: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
 
 pub(crate) struct State {
     start: PathBuf,
@@ -52,7 +62,7 @@ impl State {
         let path = locate_project(&self.start)
             .ok_or_else(|| Error::NoIndex(self.start.display().to_string()))?;
         let m = std::fs::metadata(&path)?;
-        let key = (path.clone(), m.len(), m.modified().ok());
+        let key = (path.clone(), m.len(), m.modified().ok(), file_id(&m));
         let mut g = lock(&self.db);
         if g.as_ref().is_none_or(|(k, _, _)| *k != key) {
             *g = None; // drop the old mapping before opening the new file
@@ -197,6 +207,36 @@ mod tests {
         std::fs::write(d.path().join("b.txt"), "two\n").unwrap();
         crate::index_project(d.path(), &FakeEmbedder, false).unwrap();
         assert_eq!(s.with_db(|_, db| Ok(db.index().len())).unwrap(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reindex_with_same_size_and_mtime_is_picked_up_by_inode() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join(".pith");
+        let text = |s: &State| {
+            s.with_db(|_, db| Ok(db.chunk(0).unwrap().text.clone()))
+                .unwrap()
+        };
+        std::fs::write(d.path().join("a.txt"), "one\n").unwrap();
+        crate::index_project(d.path(), &FakeEmbedder, false).unwrap();
+        let before = std::fs::metadata(&db).unwrap();
+        let s = State::new(d.path().to_path_buf());
+        assert_eq!(text(&s), "one");
+        std::fs::write(d.path().join("a.txt"), "two\n").unwrap();
+        crate::index_project(d.path(), &FakeEmbedder, false).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        let after = std::fs::metadata(&db).unwrap();
+        assert_eq!(
+            (after.len(), after.modified().ok()),
+            (before.len(), before.modified().ok())
+        );
+        assert_eq!(text(&s), "two");
     }
 
     #[test]

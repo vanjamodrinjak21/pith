@@ -407,32 +407,25 @@ fn single_chunk(text: String) -> (Vec<StoredChunk>, VectorIndex) {
 }
 
 #[test]
-fn write_enforces_table_bound_exactly() {
-    // count 1: bound = 9,696 + 65,536 = 75,232. Table = model "m" (5) + 8 + flag 1
-    // + path "p" (5) + lines 8 + text (4 + L) = 31 + L. One text far over its
-    // 1,400-char share is fine: the budget is per table, not per field.
+fn write_refuses_a_chunk_over_its_field_limit() {
+    // Per-field limits (text 5,600 bytes, path 4,096) now apply before the per-table bound,
+    // which per-field-valid chunks reach only above ~4,000 chunks; its exact edge is covered
+    // by the `check_table_len` unit tests in storage/format.rs.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(".pith");
     let no_head = IndexMeta {
         indexed_at_unix: 0,
         git_head: None,
     };
-    let (chunks, index) = single_chunk("x".repeat(75_232 - 31));
+    let (chunks, index) = single_chunk("x".repeat(5_600));
     Db::write(&path, "m", chunks, &index, no_head.clone()).unwrap();
     assert_eq!(
         Db::open(&path, None).unwrap().chunk(0).unwrap().text.len(),
-        75_201
+        5_600
     );
-    let (chunks, index) = single_chunk("x".repeat(75_232 - 30));
+    let (chunks, index) = single_chunk("x".repeat(5_601));
     match Db::write(&path, "m", chunks, &index, no_head) {
-        Err(Error::Invalid(m)) => {
-            assert_eq!(
-                m,
-                "the indexed text is too large to store (0.1 MB for 1 chunks); exclude \
-                 generated, vendored or duplicated files with .pithignore, or index a \
-                 smaller path"
-            )
-        }
+        Err(Error::Invalid(m)) => assert_eq!(m, "chunk 0 text is 5601 bytes (limit 5600)"),
         other => panic!("{other:?}"),
     }
 }

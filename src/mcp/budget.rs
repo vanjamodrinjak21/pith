@@ -43,7 +43,7 @@ pub(crate) fn render_hit(h: &SearchHit) -> String {
 /// Keeps hits in rank order, at most `max_per_file` per path, each text cut to its first
 /// `snippet_lines` lines, and stops at the first hit whose rendered form (see [`render_hit`])
 /// would push the estimated total (chars / 4) over `max_tokens`.
-pub fn fit_budget(
+pub(crate) fn fit_budget(
     hits: Vec<SearchHit>,
     max_tokens: usize,
     max_per_file: usize,

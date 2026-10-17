@@ -2,7 +2,7 @@
 //! which are then rescored with f32 dot products. Not strictly exact: a true top-k vector
 //! could be lost in the int8 pass (recall is checked in tests/index_reference.rs).
 
-pub mod kernel;
+pub(crate) mod kernel;
 mod quant;
 
 use crate::{Error, Result};
@@ -14,7 +14,13 @@ use std::sync::Arc;
 /// Candidates kept per requested hit during the int8 scan.
 const CANDIDATE_MULT: usize = 4;
 
+/// Largest supported vector dimension.
+pub const MAX_DIM: usize = 65_536;
+
 fn check_parts(dim: usize, full: &[f32]) -> Result<()> {
+    if dim > MAX_DIM {
+        return Err(Error::Invalid(format!("dimension {dim} exceeds {MAX_DIM}")));
+    }
     if full.iter().any(|x| !x.is_finite()) {
         return Err(Error::NonFinite);
     }
@@ -223,5 +229,25 @@ impl VectorIndex {
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
         hits.truncate(k);
         Ok(hits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dimension_over_the_limit_is_an_error() {
+        let mut v = vec![0.0f32; MAX_DIM + 1];
+        v[0] = 1.0;
+        assert!(matches!(
+            VectorIndex::build(vec![v]),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            VectorIndex::from_parts(MAX_DIM + 1, vec![], vec![]),
+            Err(Error::Invalid(_))
+        ));
+        assert!(VectorIndex::from_parts(MAX_DIM, vec![], vec![]).is_ok());
     }
 }

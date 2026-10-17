@@ -66,13 +66,7 @@ impl Server {
             let c = db
                 .chunk(a.chunk_id)
                 .ok_or_else(|| Error::Invalid(format!("no chunk with id {}", a.chunk_id)))?;
-            Ok(format!(
-                "{}:{}-{}\n{}\n",
-                clean(&c.path),
-                c.start_line,
-                c.end_line,
-                clean_block(&c.text)
-            ))
+            Ok(render_chunk(c))
         }))
     }
 
@@ -99,6 +93,26 @@ pub(crate) fn staleness(git_head: Option<&str>, indexed_at: u64, now: u64) -> St
 pub(crate) fn render_response(header: &str, hits: &[SearchHit]) -> String {
     let mut out = header.to_string();
     out.extend(hits.iter().map(render_hit));
+    out
+}
+
+const CUT_MARKER: &str = "\n[truncated: chunk exceeds the response cap]\n";
+
+/// One full chunk, cut to the same token cap as search_code (chars / 4).
+fn render_chunk(c: &crate::storage::StoredChunk) -> String {
+    let mut out = format!(
+        "{}:{}-{}\n{}\n",
+        clean(&c.path),
+        c.start_line,
+        c.end_line,
+        clean_block(&c.text)
+    );
+    let max = MAX_TOKENS * 4;
+    if out.chars().count() > max {
+        let keep = max - CUT_MARKER.chars().count();
+        out = out.chars().take(keep).collect();
+        out.push_str(CUT_MARKER);
+    }
     out
 }
 
@@ -171,6 +185,21 @@ pub(crate) async fn serve(state: Arc<State>, max_line: usize) -> crate::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_chunk_output_is_capped() {
+        let c = |text: String| crate::storage::StoredChunk {
+            path: "a.rs".into(),
+            start_line: 1,
+            end_line: 1,
+            text,
+        };
+        let small = render_chunk(&c("fn a() {}".into()));
+        assert_eq!(small, "a.rs:1-1\nfn a() {}\n");
+        let big = render_chunk(&c("é".repeat(50_000)));
+        assert_eq!(big.chars().count(), MAX_TOKENS * 4);
+        assert!(big.ends_with(CUT_MARKER));
+    }
 
     #[test]
     fn k_is_clamped_to_1_through_20() {

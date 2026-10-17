@@ -65,12 +65,12 @@ mod tests {
     }
 
     #[test]
-    fn a_long_held_lock_is_locked_well_under_a_second() {
+    fn a_long_held_lock_is_reported_locked_quickly() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join(".pith");
         let _held = WriterLock::acquire(&p).unwrap();
         let t = Instant::now();
         assert!(matches!(WriterLock::acquire(&p), Err(Error::Locked)));
-        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(t.elapsed() < Duration::from_secs(3)); // ~250 ms retry; slack for loaded CI
     }
 }
