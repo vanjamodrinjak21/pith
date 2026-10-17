@@ -2,6 +2,7 @@
 name = "pithdb"
 version = "0.0.1"
 edition = "2021"
+rust-version = "1.89"
 description = "Pith: lightweight embeddable vector database with built-in ONNX embeddings (name reservation, work in progress)"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -10,8 +11,10 @@ categories = ["database-implementations"]
 
 [dependencies]
 blake3 = "1.8.7"
+bytemuck = "1.25.2"
 clap = { version = "4.6.7", features = ["derive"] }
 memmap2 = "0.9.11"
+tempfile = "3.27.0"
 thiserror = "2.0.21"
 zstd = "0.14.3"
 
@@ -27,4 +30,6 @@ mcp = []
 
 [dev-dependencies]
 proptest = "1.12.0"
-tempfile = "3.27.0"
+
+[target."cfg(unix)".dependencies]
+rustix = { version = "1.1.5", features = ["process"] }

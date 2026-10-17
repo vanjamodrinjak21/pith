@@ -10,11 +10,12 @@ pub fn scale_for(values: &[f32]) -> f32 {
     }
 }
 
+pub fn quantize_one(x: f32, scale: f32) -> i8 {
+    (x / scale).round().clamp(-127.0, 127.0) as i8
+}
+
 pub fn quantize(values: &[f32], scale: f32) -> Vec<i8> {
-    values
-        .iter()
-        .map(|x| (x / scale).round().clamp(-127.0, 127.0) as i8)
-        .collect()
+    values.iter().map(|&x| quantize_one(x, scale)).collect()
 }
 
 #[cfg(test)]

@@ -8,6 +8,8 @@ mod quant;
 use crate::{Error, Result};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::ops::Range;
+use std::sync::Arc;
 
 /// Candidates kept per requested hit during the int8 scan.
 const CANDIDATE_MULT: usize = 4;
@@ -22,16 +24,54 @@ fn check_parts(dim: usize, full: &[f32]) -> Result<()> {
     Ok(())
 }
 
+/// Checks shape, finiteness and that `quantized == quantize(full)`; returns the scale.
+/// Compares element by element so no second copy of the vectors is allocated.
+fn validate(dim: usize, quantized: &[i8], full: &[f32]) -> Result<f32> {
+    let ok = quantized.len() == full.len()
+        && (dim == 0 && full.is_empty() || dim > 0 && full.len().is_multiple_of(dim));
+    if !ok {
+        return Err(Error::CorruptIndex(format!(
+            "dim {dim}, {} quantized, {} full values",
+            quantized.len(),
+            full.len()
+        )));
+    }
+    check_parts(dim, full)?;
+    let scale = quant::scale_for(full);
+    if full
+        .iter()
+        .zip(quantized)
+        .any(|(&x, &q)| quant::quantize_one(x, scale) != q)
+    {
+        return Err(Error::CorruptIndex(
+            "quantized data does not match full vectors".into(),
+        ));
+    }
+    Ok(scale)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hit {
     pub id: u32,
     pub score: f32,
 }
 
+/// Vector storage: owned, or a view into a shared read-only file mapping.
+enum Store {
+    Owned {
+        quantized: Vec<i8>,
+        full: Vec<f32>,
+    },
+    Mapped {
+        map: Arc<memmap2::Mmap>,
+        quantized: Range<usize>,
+        full: Range<usize>,
+    },
+}
+
 pub struct VectorIndex {
     dim: usize,
-    quantized: Vec<i8>,
-    full: Vec<f32>,
+    store: Store,
     /// Query quantization scale; matches the stored data's scale.
     scale: f32,
 }
@@ -54,33 +94,45 @@ impl VectorIndex {
         let scale = quant::scale_for(&full);
         Ok(Self {
             dim,
-            quantized: quant::quantize(&full, scale),
-            full,
+            store: Store::Owned {
+                quantized: quant::quantize(&full, scale),
+                full,
+            },
             scale,
         })
     }
 
     pub fn from_parts(dim: usize, quantized: Vec<i8>, full: Vec<f32>) -> Result<Self> {
-        let ok = quantized.len() == full.len()
-            && (dim == 0 && full.is_empty() || dim > 0 && full.len().is_multiple_of(dim));
-        if !ok {
-            return Err(Error::CorruptIndex(format!(
-                "dim {dim}, {} quantized, {} full values",
-                quantized.len(),
-                full.len()
-            )));
-        }
-        check_parts(dim, &full)?;
-        let scale = quant::scale_for(&full);
-        if quant::quantize(&full, scale) != quantized {
-            return Err(Error::CorruptIndex(
-                "quantized data does not match full vectors".into(),
-            ));
-        }
+        let scale = validate(dim, &quantized, &full)?;
         Ok(Self {
             dim,
-            quantized,
-            full,
+            store: Store::Owned { quantized, full },
+            scale,
+        })
+    }
+
+    /// A zero-copy index over `map[quantized]` (int8) and `map[full]` (f32, native
+    /// endian, 4-byte aligned). Validated exactly like [`from_parts`](Self::from_parts).
+    pub fn from_mapped(
+        dim: usize,
+        map: Arc<memmap2::Mmap>,
+        quantized: Range<usize>,
+        full: Range<usize>,
+    ) -> Result<Self> {
+        let bad = |what: &str| {
+            Error::CorruptIndex(format!("mapped {what} section out of bounds or misaligned"))
+        };
+        let q = map.get(quantized.clone()).ok_or_else(|| bad("int8"))?;
+        let f = map.get(full.clone()).ok_or_else(|| bad("f32"))?;
+        let f: &[f32] = bytemuck::try_cast_slice(f).map_err(|_| bad("f32"))?;
+        let scale = validate(dim, bytemuck::cast_slice(q), f)?;
+        Ok(Self {
+            dim,
+            store: Store::Mapped {
+                map,
+                quantized,
+                full,
+            },
             scale,
         })
     }
@@ -93,7 +145,7 @@ impl VectorIndex {
         if self.dim == 0 {
             0
         } else {
-            self.full.len() / self.dim
+            self.full().len() / self.dim
         }
     }
 
@@ -102,11 +154,18 @@ impl VectorIndex {
     }
 
     pub fn quantized(&self) -> &[i8] {
-        &self.quantized
+        match &self.store {
+            Store::Owned { quantized, .. } => quantized,
+            Store::Mapped { map, quantized, .. } => bytemuck::cast_slice(&map[quantized.clone()]),
+        }
     }
 
     pub fn full(&self) -> &[f32] {
-        &self.full
+        match &self.store {
+            Store::Owned { full, .. } => full,
+            // Alignment and length were checked in `from_mapped`.
+            Store::Mapped { map, full, .. } => bytemuck::cast_slice(&map[full.clone()]),
+        }
     }
 
     /// Like [`try_search`](Self::try_search), but returns empty on a dimension
@@ -142,7 +201,7 @@ impl VectorIndex {
         let cap = k.saturating_mul(CANDIDATE_MULT).max(32).min(self.len());
         // Min-heap of the best `cap` int8 scores.
         let mut heap: BinaryHeap<Reverse<(i32, u32)>> = BinaryHeap::with_capacity(cap + 1);
-        kernel::dot_i8_rows(&q8, &self.quantized, |id, s| {
+        kernel::dot_i8_rows(&q8, self.quantized(), |id, s| {
             if heap.len() < cap {
                 heap.push(Reverse((s, id as u32)));
             } else if s > heap.peek().unwrap().0 .0 {
@@ -150,10 +209,11 @@ impl VectorIndex {
                 heap.push(Reverse((s, id as u32)));
             }
         });
+        let full = self.full();
         let mut hits: Vec<Hit> = heap
             .into_iter()
             .map(|Reverse((_, id))| {
-                let row = &self.full[id as usize * self.dim..][..self.dim];
+                let row = &full[id as usize * self.dim..][..self.dim];
                 Hit {
                     id,
                     score: row.iter().zip(query).map(|(a, b)| a * b).sum(),
