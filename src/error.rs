@@ -3,6 +3,10 @@
 pub enum Error {
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
+    #[error("dimension mismatch: expected {expected}, got {got}")]
+    DimMismatch { expected: usize, got: usize },
+    #[error("corrupt index: {0}")]
+    CorruptIndex(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
