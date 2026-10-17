@@ -23,16 +23,12 @@ const DENIED_NAMES: [&str; 12] = [
     "secrets.yml",
     ".env",
 ];
-/// A denied name plus one of these is a backup of a secret (`credentials.bak`);
-/// `credentials.rs` is source and stays indexed.
-const BACKUP_SUFFIXES: [&str; 10] = [
-    ".bak", ".old", ".orig", ".save", ".backup", ".tmp", ".swp", ".copy", ".dist", "~",
+/// Backup / temp / swap suffixes, stripped repeatedly by `normalize_name`
+/// (`credentials.bak.old` is `credentials`); `credentials.rs` is source and stays indexed.
+const BACKUP_SUFFIXES: [&str; 11] = [
+    ".bak", ".old", ".orig", ".save", ".backup", ".tmp", ".swp", ".swo", ".swn", ".copy", ".dist",
 ];
-/// Final extensions of backups / temp copies; with a denied extension before them
-/// (`server.pem.bak`, `key.pfx.old`) the file is denied.
-const BACKUP_EXT: [&str; 9] = [
-    "bak", "old", "orig", "save", "backup", "tmp", "swp", "copy", "dist",
-];
+const SWAP_SUFFIXES: [&str; 3] = [".swp", ".swo", ".swn"];
 /// Source and document extensions: a secret-looking name part alone (`api.key.ts`,
 /// `id_rsa_helper.ts`) does not deny these. Exact secret names still do.
 const SOURCE_EXT: [&str; 18] = [
@@ -68,46 +64,84 @@ fn dir_denied(parts: &[String]) -> bool {
     parts.iter().any(|c| c == ".ssh" || c == ".gnupg")
 }
 
+/// Strips editor and backup decorations until none are left: `#x#`, trailing `~`,
+/// the backup suffixes, and numeric suffixes of 1 to 3 digits (`credentials.1`).
+/// Numeric suffixes only matter when what remains is an exact secret name, so ordinary
+/// names such as `config.v2.json` (which do not end in digits) are untouched.
+fn normalize_name(n: &str) -> String {
+    let mut s = n;
+    loop {
+        if s.len() >= 2 && s.starts_with('#') && s.ends_with('#') {
+            s = &s[1..s.len() - 1];
+        } else if let Some(t) = s.strip_suffix('~') {
+            s = t;
+        } else if let Some(t) = BACKUP_SUFFIXES.iter().find_map(|x| s.strip_suffix(x)) {
+            s = t;
+        } else if let Some((t, d)) = s.rsplit_once('.') {
+            if t.is_empty() || d.is_empty() || d.len() > 3 || !d.bytes().all(|b| b.is_ascii_digit())
+            {
+                return s.to_owned();
+            }
+            s = t;
+        } else {
+            return s.to_owned();
+        }
+    }
+}
+
+/// Normalized forms of a name. A vim swap file `.x.swp` is the swap of `x`, but `.env.swp`
+/// is also the swap of `.env`, so both readings are tried.
+fn variants(n: &str) -> Vec<String> {
+    let mut v = vec![normalize_name(n)];
+    if n.starts_with('.') && SWAP_SUFFIXES.iter().any(|x| n.ends_with(x)) {
+        v.push(normalize_name(&n[1..]));
+    }
+    v
+}
+
+/// Rules on one normalized name.
 fn name_denied(n: &str) -> bool {
     if SAFE_ENV.contains(&n) {
         return false;
     }
-    let core = BACKUP_SUFFIXES
-        .iter()
-        .find_map(|s| n.strip_suffix(s))
-        .unwrap_or(n);
-    if DENIED_NAMES.contains(&core)
-        || ((core.starts_with("service-account") || core.starts_with("service_account"))
-            && core.ends_with(".json"))
+    if DENIED_NAMES.contains(&n)
+        || ((n.starts_with("service-account") || n.starts_with("service_account"))
+            && n.ends_with(".json"))
     {
         return true;
     }
-    let trimmed = n.trim_end_matches('~');
-    let segs: Vec<&str> = trimmed.split('.').collect();
+    let segs: Vec<&str> = n.split('.').collect();
     let last = if segs.len() > 1 {
         segs[segs.len() - 1]
     } else {
         ""
     };
-    if SOURCE_EXT.contains(&last) {
-        return false;
-    }
-    if KEY_PREFIXES.iter().any(|p| n.starts_with(p)) && !n.ends_with(".pub") {
-        return true;
-    }
-    // Earlier segments only count when the name ends in a backup suffix.
-    let earlier_denied = segs.len() > 2
-        && segs[1..segs.len() - 1]
-            .iter()
-            .any(|s| DENIED_EXT.contains(s));
-    n.starts_with(".env.")
+    let pubkey = n.ends_with(".pub");
+    // Never softened by a source extension: `.env.yaml`, `id_rsa.txt`, `x.tfvars.yaml`.
+    if n.starts_with(".env.")
         || n.ends_with(".env")
         || DENIED_EXT.contains(&last)
-        || (BACKUP_EXT.contains(&last) && earlier_denied)
         || segs
             .iter()
             .skip(1)
             .any(|seg| *seg == "tfvars" || seg.starts_with("tfstate"))
+        || (!pubkey
+            && KEY_PREFIXES
+                .iter()
+                .any(|p| n == *p || n.starts_with(&format!("{p}."))))
+    {
+        return true;
+    }
+    // Heuristics a source or document extension softens: a key prefix inside a longer
+    // identifier (`id_rsa_helper.ts`) and a key extension in a middle segment (`api.key.ts`).
+    if SOURCE_EXT.contains(&last) {
+        return false;
+    }
+    (!pubkey && KEY_PREFIXES.iter().any(|p| n.starts_with(p)))
+        || (segs.len() > 2
+            && segs[1..segs.len() - 1]
+                .iter()
+                .any(|s| DENIED_EXT.contains(s)))
 }
 
 /// True when `rel_path` (relative to the project root) must never be read or indexed.
@@ -117,13 +151,16 @@ pub fn is_denied(rel_path: &Path) -> bool {
     if dir_denied(&parts) {
         return true;
     }
-    if parts
-        .windows(2)
-        .any(|w| DENIED_PAIRS.iter().any(|(d, f)| w[0] == *d && w[1] == *f))
-    {
+    if parts.windows(2).any(|w| {
+        variants(&w[1])
+            .iter()
+            .any(|f| DENIED_PAIRS.iter().any(|(d, df)| w[0] == *d && f == df))
+    }) {
         return true;
     }
-    parts.last().is_some_and(|n| name_denied(n))
+    parts
+        .last()
+        .is_some_and(|n| variants(n).iter().any(|v| name_denied(v)))
 }
 
 /// Directory-only check (file-name rules must not hide a directory called `credentials`).
@@ -143,4 +180,100 @@ pub(super) fn is_denied_root(canonical_root: &Path) -> bool {
 pub(super) fn is_db_file(name: &str) -> bool {
     let n = name.to_lowercase();
     n == ".pith" || n == ".pith.lock" || n.starts_with(".pith.tmp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    const DECOR: [&str; 14] = [
+        ".bak", ".old", ".orig", ".save", ".backup", ".tmp", ".swp", ".swo", ".swn", ".copy",
+        ".dist", ".1", ".12", "~",
+    ];
+    const SECRET_NAMES: [&str; 14] = [
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".git-credentials",
+        ".htpasswd",
+        ".envrc",
+        "credentials",
+        "credentials.json",
+        "secrets.json",
+        "secrets.yaml",
+        "secrets.yml",
+        ".env",
+        "service-account.json",
+        "service_account_x.json",
+    ];
+    const SOURCE_NAMES: [&str; 8] = [
+        "credentials.rs",
+        "env.ts",
+        "api.key.ts",
+        "id_rsa_helper.ts",
+        "config.v2.json",
+        "config.rs",
+        "config.json.schema.ts",
+        "secrets.rs",
+    ];
+
+    /// 0..=3 stacked decorations, then optionally one editor wrapper.
+    fn decorate(name: &str, picks: &[usize], wrap: u8) -> String {
+        let mut s = name.to_owned();
+        for &i in picks {
+            s.push_str(DECOR[i % DECOR.len()]);
+        }
+        match wrap % 4 {
+            1 => format!(".{s}.swp"),
+            2 => format!("#{s}#"),
+            3 => format!("{s}~"),
+            _ => s,
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn strong_rules_ignore_source_extensions(
+            ni in 0usize..6,
+            ei in 0usize..SOURCE_EXT.len(),
+        ) {
+            let base = [".env", ".env.local", "x.tfvars", "x.tfstate", "id_rsa", "id_ed25519"][ni];
+            let f = format!("{base}.{}", SOURCE_EXT[ei]);
+            prop_assert!(is_denied(Path::new(&f)), "{f}");
+        }
+
+        #[test]
+        fn decorated_secret_names_are_denied(
+            ni in 0usize..SECRET_NAMES.len(),
+            picks in prop::collection::vec(0usize..DECOR.len(), 0..=3),
+            wrap in 0u8..4,
+        ) {
+            let f = decorate(SECRET_NAMES[ni], &picks, wrap);
+            prop_assert!(is_denied(Path::new(&f)), "{f}");
+            prop_assert!(is_denied(&Path::new("sub").join(&f)), "sub/{f}");
+        }
+
+        #[test]
+        fn decorated_pairs_are_denied(
+            pi in 0usize..DENIED_PAIRS.len(),
+            picks in prop::collection::vec(0usize..DECOR.len(), 0..=3),
+            wrap in 0u8..4,
+        ) {
+            let (d, f) = DENIED_PAIRS[pi];
+            let p = format!("{d}/{}", decorate(f, &picks, wrap));
+            prop_assert!(is_denied(Path::new(&p)), "{p}");
+            prop_assert!(is_denied(Path::new(&format!("x/{p}"))), "x/{p}");
+        }
+    }
+
+    #[test]
+    fn known_source_names_stay_allowed() {
+        for n in SOURCE_NAMES {
+            assert!(!is_denied(Path::new(n)), "{n}");
+            for d in [".kube", ".docker", ".aws"] {
+                assert!(!is_denied(&Path::new(d).join(n)), "{d}/{n}");
+            }
+        }
+    }
 }
