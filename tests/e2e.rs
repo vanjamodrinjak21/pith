@@ -26,6 +26,22 @@ fn open(root: &Path) -> (std::path::PathBuf, Db) {
     open_project(root).unwrap()
 }
 
+struct Failing;
+impl Embedder for Failing {
+    fn model_id(&self) -> &str {
+        "fail"
+    }
+    fn dim(&self) -> usize {
+        384
+    }
+    fn embed_passages(&self, _: &[String]) -> Result<Vec<Vec<f32>>> {
+        Err(Error::Embed("boom".into()))
+    }
+    fn embed_query(&self, _: &str) -> Result<Vec<f32>> {
+        Err(Error::Embed("boom".into()))
+    }
+}
+
 struct Other(FakeEmbedder);
 impl Embedder for Other {
     fn model_id(&self) -> &str {
@@ -161,7 +177,9 @@ fn index_sets_git_head_only_in_git_repos() {
     index_project(plain.path(), &FakeEmbedder, false).unwrap();
     assert_eq!(open(plain.path()).1.meta().git_head, None);
     if Command::new("git").arg("--version").output().is_err() {
-        eprintln!("git half of index_sets_git_head_only_in_git_repos skipped: git not found");
+        println!(
+            "SKIPPED: git half of index_sets_git_head_only_in_git_repos skipped: git not found"
+        );
         return;
     }
 
@@ -322,7 +340,7 @@ fn second_writer_fails_fast_with_locked() {
 fn unreadable_existing_index_reports_the_io_error_not_corruption() {
     use std::os::unix::fs::PermissionsExt;
     if rustix::process::geteuid().is_root() {
-        eprintln!("skipping unreadable_existing_index test: running as root ignores mode bits");
+        println!("SKIPPED: unreadable_existing_index test: running as root ignores mode bits");
         return;
     }
     let d = project();
@@ -443,6 +461,15 @@ fn lock_file_is_gitignored_even_when_indexing_fails() {
     assert!(matches!(e, Error::ModelMismatch { .. }));
     let g = fs::read_to_string(d.path().join(".gitignore")).unwrap();
     assert!(g.lines().any(|l| l == ".pith.lock"), "{g}");
+    // The first run failed before any .pith existed (the tampered db is the only one): fresh dir.
+    let fresh = project();
+    fs::write(fresh.path().join(".gitignore"), "target/\n").unwrap();
+    let e = index_project(fresh.path(), &Failing, false).unwrap_err();
+    assert!(matches!(e, Error::Embed(_)));
+    assert_eq!(
+        fs::read_to_string(fresh.path().join(".gitignore")).unwrap(),
+        "target/\n.pith.lock\n"
+    );
 }
 
 #[cfg(unix)]
@@ -451,10 +478,11 @@ fn error_messages_with_escape_bytes_in_paths_are_scrubbed() {
     let d = tempfile::tempdir().unwrap();
     let evil = d.path().canonicalize().unwrap().join("x\x1b[2Jy");
     fs::create_dir(&evil).unwrap();
+    fs::write(evil.join("f\x1b[2J"), "x").unwrap(); // a file given as the index root: error embeds the path
     for args in [
         vec!["stats"],
         vec!["search", "q"],
-        vec!["index", "nonexistent\x1b[2J"],
+        vec!["index", "f\x1b[2J"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_pith"))
             .args(&args)
@@ -473,4 +501,10 @@ fn error_messages_with_escape_bytes_in_paths_are_scrubbed() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stderr).contains("x?[2Jy"));
+    let out = Command::new(env!("CARGO_BIN_EXE_pith"))
+        .args(["index", "f\x1b[2J"])
+        .current_dir(&evil)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("f?[2J is not a directory"));
 }

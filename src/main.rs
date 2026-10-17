@@ -126,6 +126,13 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Index { path, reindex } => {
+            // Fail before loading the model; index_project re-checks.
+            if !path.is_dir() {
+                return Err(Error::Invalid(format!(
+                    "{} is not a directory",
+                    path.display()
+                )));
+            }
             let embedder = load_default_embedder()?;
             let t = Instant::now();
             let r = index_project(&path, embedder.as_ref(), reindex)?;

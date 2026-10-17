@@ -112,7 +112,7 @@ fn git_head(root: &Path) -> Option<String> {
 /// Never creates the file and never rewrites existing content. The file is opened without
 /// following a symlink and checked as a regular file on the open handle; all reads and the
 /// append go through that handle.
-fn update_gitignore(root: &Path) -> Result<()> {
+fn update_gitignore(root: &Path, with_db: bool) -> Result<()> {
     use std::io::{Read, Write};
     let path = root.join(".gitignore");
     let open = |write: bool| {
@@ -148,7 +148,12 @@ fn update_gitignore(root: &Path) -> Result<()> {
             .any(|l| l == name || l.strip_prefix('/') == Some(name))
     };
     let mut add = String::new();
-    for name in [DB_NAME, ".pith.lock"] {
+    let names: &[&str] = if with_db {
+        &[DB_NAME, ".pith.lock"]
+    } else {
+        &[".pith.lock"]
+    };
+    for name in names.iter().copied() {
         if !listed(name) {
             add.push_str(name);
             add.push('\n');
@@ -196,7 +201,9 @@ pub fn index_project(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Res
 
 /// Best-effort `.gitignore` update; returns the warning text on failure.
 fn gitignore_warning(root: &Path) -> Option<String> {
-    update_gitignore(root).err().map(|e| {
+    // `.pith` is listed only once it exists; a failed first run leaves just the lock file.
+    let with_db = root.join(DB_NAME).symlink_metadata().is_ok();
+    update_gitignore(root, with_db).err().map(|e| {
         format!(
             "pith: warning: could not update .gitignore: {}",
             clean(&e.to_string())
@@ -516,8 +523,10 @@ pub(crate) fn clean(s: &str) -> String {
         .map(|c| match c {
             '\t' => ' ',
             c if c.is_control() => '?',
-            // Invisible/bidi-override characters that can spoof what a line says.
-            '\u{200B}'..='\u{200F}'
+            // Invisible/bidi-override characters that can spoof what a line says (not ZWJ/ZWNJ).
+            '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
             | '\u{2028}'..='\u{202E}'
             | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
@@ -562,12 +571,16 @@ mod tests {
     #[test]
     fn clean_scrubs_spoofing_characters() {
         for c in [
-            '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}',
-            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
-            '\u{2068}', '\u{2069}', '\u{FEFF}', '\x1b', '\u{7f}', '\u{85}',
+            '\u{200B}', '\u{061C}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}',
+            '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}', '\u{202B}', '\u{202C}',
+            '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{FEFF}',
+            '\x1b', '\u{7f}', '\u{85}',
         ] {
             assert_eq!(clean(&format!("a{c}b")), "a?b", "{:x}", c as u32);
         }
+        // ZWJ/ZWNJ are load-bearing in emoji and Persian/Hindi text.
+        let keep = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{645}\u{200C}\u{6CC}";
+        assert_eq!(clean(keep), keep);
         assert_eq!(clean("a\tb h\u{e9}llo"), "a b h\u{e9}llo");
     }
 
