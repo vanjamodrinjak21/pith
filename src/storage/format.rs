@@ -72,7 +72,11 @@ pub const MIN_LEN: usize = HEADER_LEN + 32;
 /// This is a total budget per chunk (`count * PER_CHUNK_MAX` for the whole table),
 /// not a per-field limit: a single path or text over its share is absorbed by the
 /// headroom of other, typically much smaller, chunks. Only when the whole table
-/// exceeds the bound does `Db::write` refuse it with `Error::Invalid`.
+/// exceeds the bound does `Db::write` refuse it with `Error::Invalid`. The ratio
+/// bound (`MAX_RATIO`) can also refuse a table with `Error::Invalid`.
+///
+/// `CHUNK_MAX_CHARS` is not enforced here: it will be enforced by the Task 4
+/// chunker, which does not exist yet. Until then this budget is only an estimate.
 pub const PER_CHUNK_MAX: u64 = crate::CHUNK_MAX_CHARS as u64 * 4 + 4_096;
 /// Model id, meta and git head share this; also the additive slack of the ratio bound.
 pub const TABLE_SLACK: u64 = 64 << 10;
@@ -80,12 +84,25 @@ pub const TABLE_SLACK: u64 = 64 << 10;
 /// a typical chunk is ~1,400 ASCII bytes + ~100 path + 16 overhead, so 1M chunks
 /// is ~1.5e9 bytes < 4 GiB (4.29e9). Only pathological tables (e.g. 1M chunks of
 /// all-4-byte text, 1M * 9,696 = 9.7e9) hit it, and the writer refuses those.
+/// Note: 1M chunks of mostly-3-byte (CJK) text at the 1,400-char limit is ~4.3e9
+/// (1,400 * 3 + ~100 + 16 per chunk) and can exceed this ceiling; `Db::write` then
+/// refuses with the actionable "too large" error. Raising the ceiling is a
+/// deliberate decision for later (it raises the worst-case allocation a crafted
+/// file can force), not an oversight.
 pub const TABLE_RAW_CEILING: u64 = 4 << 30;
-/// Largest raw/compressed ratio a file may declare. The count-derived bound alone is
-/// controlled by the (crafted) header, so the raw length is also bounded by bytes
-/// that really exist. zstd on highly repetitive text can exceed 100x, so the margin
-/// is generous; it still bounds a 1 MB file to about 1 GB.
-pub const MAX_RATIO: u64 = 1024;
+/// Largest raw/compressed ratio a file may declare: defense in depth against a
+/// crafted header claiming a huge raw table for a tiny payload.
+///
+/// Why 16384 and not tighter: duplicated corpora (vendored or generated copies)
+/// compress very well (100k identical 1,400-char chunks reach ~10,864:1), and
+/// `pith index` must not fail on them. The looser ratio is safe because it is not
+/// the primary bound: the layout check ties `count` to vector bytes that must really
+/// exist (`count * dim * 5 <= file size`), and `PER_CHUNK_MAX` bounds raw bytes per
+/// chunk, so at a realistic dim (384) raw <= 9,696 / 1,920 * file size, about 5x the
+/// file size. Only a crafted tiny-dim file is exposed to this looser bound, and it
+/// still caps a 1 MB file at about 16 GB claimed, further clamped by the 4 GiB
+/// ceiling and reserved only as bytes are really produced.
+pub const MAX_RATIO: u64 = 16_384;
 /// Decompression grows in steps of this size, each reserved fallibly.
 const GROW_BLOCK: usize = 1 << 20;
 
@@ -217,11 +234,23 @@ pub fn encode(
         table.extend_from_slice(&c.end_line.to_le_bytes());
         put_str(&mut table, &c.text)?;
     }
-    // Cheap count check before compressing; the full check needs the packed size.
-    check_table_len(table.len() as u64, u64::MAX, count as u64).map_err(Error::Invalid)?;
+    // Count check before compressing (passes the ratio check by construction);
+    // after compressing, only the ratio check can still fail.
+    const REMEDY: &str = "exclude generated, vendored or duplicated files with \
+                          .pithignore, or index a smaller path";
+    let mb = table.len() as f64 / 1e6;
+    check_table_len(table.len() as u64, u64::MAX, count as u64).map_err(|_| {
+        Error::Invalid(format!(
+            "the indexed text is too large to store ({mb:.1} MB for {count} chunks); {REMEDY}"
+        ))
+    })?;
     let packed = zstd::bulk::compress(&table, ZSTD_LEVEL)?;
-    check_table_len(table.len() as u64, packed.len() as u64, count as u64)
-        .map_err(Error::Invalid)?;
+    check_table_len(table.len() as u64, packed.len() as u64, count as u64).map_err(|_| {
+        Error::Invalid(format!(
+            "the indexed text is too repetitive to store safely ({mb:.1} MB compresses \
+             over {MAX_RATIO}:1); {REMEDY}"
+        ))
+    })?;
     let quant: &[u8] = bytemuck::cast_slice(index.quantized());
     let full: &[u8] = bytemuck::cast_slice(index.full()); // LE: big-endian is refused above
 
@@ -498,22 +527,40 @@ mod tests {
 
     #[test]
     fn header_claiming_the_maximum_fails_without_large_reservation() {
-        let p = packed();
-        for count in [0u64, 1, 1_000, u32::MAX as u64] {
-            let max = table_raw_max(count).min(table_ratio_max(p.len() as u64));
+        // Payload of 4 KiB of hash-scrambled bytes that decompresses to `content`; big enough
+        // that for counts 0, 1 and 1000 the count-derived bound is the binding one.
+        let content: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let p = zstd::bulk::compress(&content, 3).unwrap();
+        for count in [0u64, 1, 1_000] {
+            let max = table_raw_max(count);
+            assert!(
+                max < table_ratio_max(p.len() as u64),
+                "count bound must bind"
+            );
             assert!(check_table_len(max, p.len() as u64, count).is_ok());
             assert!(check_table_len(max + 1, p.len() as u64, count).is_err());
             let (r, reserved) = hooked(false, || decompress_bounded(&p, max, count));
             match r {
                 Err(Error::CorruptDb(m)) => {
-                    assert!(m.contains(&format!("4 bytes, header says {max}")), "{m}")
+                    let want = format!("{} bytes, header says {max}", content.len());
+                    assert!(m.contains(&want), "{m}")
                 }
                 other => panic!("{other:?}"),
             }
-            // Up front: proportional to the input; then at most one block ahead of
-            // the bytes really produced.
-            assert!(reserved <= 4 + GROW_BLOCK, "{reserved} for claim {max}");
+            // Up front min(claim + 1, packed * 64 + 4 KiB); then at most one block
+            // past the bytes produced, and never past the claim + 1.
+            let bound = (max as usize + 1).min(content.len() + GROW_BLOCK);
+            assert!(reserved <= bound, "{reserved} for claim {max}");
         }
+        // Huge count: the ratio bound binds; a tiny payload reserves only a few KiB.
+        let tiny = packed();
+        let max = table_ratio_max(tiny.len() as u64);
+        assert!(max < table_raw_max(u32::MAX as u64));
+        let (r, reserved) = hooked(false, || decompress_bounded(&tiny, max, u32::MAX as u64));
+        assert!(matches!(r, Err(Error::CorruptDb(m)) if m.contains("4 bytes, header says")));
+        assert!(reserved <= 4 + GROW_BLOCK, "{reserved}");
     }
 
     #[test]

@@ -426,17 +426,21 @@ fn write_enforces_table_bound_exactly() {
     let (chunks, index) = single_chunk("x".repeat(75_232 - 30));
     match Db::write(&path, "m", chunks, &index, no_head) {
         Err(Error::Invalid(m)) => {
-            assert_eq!(m, "chunk table length 75233 over limit 75232 for 1 chunks")
+            assert_eq!(
+                m,
+                "the indexed text is too large to store (0.1 MB for 1 chunks); exclude \
+                 generated, vendored or duplicated files with .pithignore, or index a \
+                 smaller path"
+            )
         }
         other => panic!("{other:?}"),
     }
 }
 
 #[test]
-fn highly_compressible_table_never_writes_unopenable_file() {
-    // 100k identical 1,400-char chunks: ~141 MB raw that zstd shrinks far more than
-    // 1024x. Decision: the writer applies the reader's ratio bound and refuses it
-    // with Invalid, so no file is produced that would fail to open.
+fn highly_compressible_table_is_accepted() {
+    // 100k identical 1,400-char chunks (~141 MB raw, ~10,864:1): a duplicated corpus
+    // well over the old 1024:1 bound must still index, round-trip and open.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(".pith");
     let n = 100_000;
@@ -450,14 +454,50 @@ fn highly_compressible_table_never_writes_unopenable_file() {
         })
         .collect();
     let index = VectorIndex::build(vec![vec![1.0]; n]).unwrap();
+    Db::write(&path, "m", chunks, &index, meta()).unwrap();
+    let b = fs::read(&path).unwrap();
+    let ratio = u64_at(&b, RAW_LEN_AT) / u64_at(&b, CHUNKS_LEN_AT);
+    assert!(ratio > 1024, "{ratio}");
+    let db = Db::open(&path, Some(("m", 1))).unwrap();
+    assert_eq!(db.index().len(), n);
+    assert_eq!(db.chunk(n as u32 - 1).unwrap().text, text);
+}
+
+/// 1M identical empty chunks: a table that compresses far beyond 16384:1.
+fn zero_entries() -> Vec<StoredChunk> {
+    (0..1_000_000)
+        .map(|_| StoredChunk {
+            path: String::new(),
+            start_line: 0,
+            end_line: 0,
+            text: String::new(),
+        })
+        .collect()
+}
+
+#[test]
+fn table_over_ratio_bound_refused_at_write_and_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".pith");
+    let chunks = zero_entries();
+    let index = VectorIndex::build(vec![vec![1.0]; chunks.len()]).unwrap();
     match Db::write(&path, "m", chunks, &index, meta()) {
         Err(Error::Invalid(m)) => {
-            assert!(m.contains("compressed bytes"), "{m}");
-            assert!(!path.exists());
+            assert!(
+                m.contains("too repetitive") && m.contains(".pithignore"),
+                "{m}"
+            )
         }
-        Ok(()) => assert!(Db::open(&path, None).is_ok()),
         other => panic!("{other:?}"),
     }
+    assert!(!path.exists());
+    // The same kind of table crafted into a file is refused on open.
+    let mut raw = table(0, 0, &[]);
+    raw.resize(raw.len() + 16 * 1_000_000, 0);
+    let packed = zstd::bulk::compress(&raw, 19).unwrap();
+    assert!(raw.len() as u64 > packed.len() as u64 * 16_384 + 65_536);
+    let m = corrupt_msg(&assemble(1, 1_000_000, &packed, raw.len() as u64));
+    assert!(m.contains("compressed bytes"), "{m}");
 }
 
 #[test]
@@ -501,9 +541,9 @@ fn decompression_is_bounded_by_stated_raw_length() {
     let m = corrupt_msg(&assemble(1, 1, &packed, 9_696 + 65_536 + 1));
     assert!(m.contains("over limit 75232 for 1 chunks"), "{m}");
     // 1 GiB claimed by a header whose count (200k, dim 1) allows it, with a tiny
-    // payload: the ratio bound (compressed bytes * 1024 + 64 KiB) refuses it.
+    // payload: the ratio bound (compressed bytes * 16384 + 64 KiB) refuses it.
     let m = corrupt_msg(&assemble(1, 200_000, &packed, 1 << 30));
-    let ratio_max = packed.len() as u64 * 1024 + 65_536;
+    let ratio_max = packed.len() as u64 * 16_384 + 65_536;
     assert!(
         m.contains(&format!(
             "over limit {ratio_max} for {} compressed bytes",
