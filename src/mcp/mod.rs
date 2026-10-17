@@ -87,9 +87,9 @@ impl State {
 }
 
 fn load_embedder() -> Result<Loaded> {
-    // Test hook, compiled only with the non-default `test-hooks` feature: integration tests
+    // Test hook, compiled only with the non-default `test-hooks` feature in debug builds: integration tests
     // drive the real binary without the ONNX model.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(all(feature = "test-hooks", debug_assertions))]
     if std::env::var_os("PITH_TEST_FAKE_EMBEDDER").is_some_and(|v| v == "1") {
         return Ok(Box::new(crate::embed::FakeEmbedder));
     }

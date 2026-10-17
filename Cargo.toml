@@ -46,7 +46,8 @@ default = ["onnx", "mcp"]
 onnx = ["dep:ort", "dep:tokenizers"]
 mcp = ["dep:rmcp", "dep:tokio", "dep:serde"]
 # Test-only: enables PITH_TEST_FAKE_EMBEDDER, which makes `pith mcp` use a fake embedder.
-# Off by default; only this crate's own dev-dependency turns it on. Never enable it in shipped builds.
+# Off by default, and compiled only when debug assertions are on, so release and bench
+# profiles never contain it even with the feature enabled. This crate's own dev-dependency turns it on.
 test-hooks = []
 
 [dev-dependencies]

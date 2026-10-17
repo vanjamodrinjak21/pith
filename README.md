@@ -14,7 +14,7 @@ exact-ish brute-force scan, see Performance), no incremental indexing, and no no
 ## Install
 
 ```sh
-cargo install pithdb      # installs the `pith` binary
+cargo install pithdb      # installs the `pith` binary (once published; until then `cargo install --path .`)
 pith init                 # asks, then downloads the embedding model (~34 MB), once
 ```
 
@@ -53,7 +53,8 @@ The model is loaded on the first search and dropped after 5 idle minutes.
   CDN **at build time**. That is the only network access during the build. Offline or air-gapped
   builds: point `ORT_LIB_PATH` at a self-built static ONNX Runtime.
 - Verified on macOS arm64 only (M4 Pro; release binary about 38 MB with the MCP server). Linux
-  x86_64 uses the same mechanism and is covered by CI, but I have not run it by hand.
+  x86_64 uses the same mechanism but is untested; CI for it is configured in
+  `.github/workflows/ci.yml` and has not run yet.
 - `cargo install pithdb --no-default-features` builds without ONNX Runtime (no embeddings).
 - Embedding uses batch size 1 by default. The int8 model quantizes activations dynamically with
   scales shared across a batch, so a text's vector depends on its batch neighbours (cosine to the
@@ -62,7 +63,9 @@ The model is loaded on the first search and dropped after 5 idle minutes.
 
 ## Performance
 
-Measured on an M4 Pro, release build.
+Measured on an M4 Pro, release build. The search row is from this repo's bench. The embedding
+rows come from the Task 5 real-model test (`cargo test --release --test embed -- --ignored
+--nocapture --test-threads=1`, 830-char chunks), not from `cargo bench`.
 
 | What | Result |
 | --- | --- |
@@ -70,10 +73,10 @@ Measured on an M4 Pro, release build.
 | Embedding, batch 1, 8 threads, 830-char chunks | 43.5 chunks/s |
 | Embedding, batch 32, 8 threads | 45.4 chunks/s |
 | Embedding, batch 1, 4 threads / 1 thread | 33.3 / 15.5 chunks/s |
-| Indexing this repo's `src/` (134 chunks) | 3.2 s |
+| Indexing a copy of `src/` as of the Task 6 smoke test (134 chunks; the tree has changed since) | 3.2 s |
 
-Embedding dominates: a 3,000-chunk repository takes about a minute to index. The batch 8/16/64
-and per-thread grid in `cargo bench --bench index` is not measured yet (it needs the model
+Embedding dominates: a 3,000-chunk repository takes about a minute to index. The batch 8/16/32/64
+and 1-8 thread grid in `cargo bench --bench index` is not measured yet (it needs the model
 installed; the bench skips itself otherwise). Search is a brute-force int8 scan with an f32
 rescore of the top candidates, not strictly exact: the true top-k can in principle be lost in the
 int8 pass.
@@ -102,7 +105,8 @@ cargo bench               # search always; embedding only if the model is instal
 ```
 
 The non-default `test-hooks` feature exists for this crate's own tests (it lets `pith mcp` use a
-fake embedder). It is test-only: never enable it in anything you ship.
+fake embedder). It is compiled only in debug builds, so release and bench profiles never
+contain it even if the feature is switched on.
 
 ## License
 

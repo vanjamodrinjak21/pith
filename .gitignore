@@ -2,3 +2,6 @@ target/
 PRD.md
 docs/superpowers/
 .superpowers/
+.claude/
+.remember/
+.madelog/

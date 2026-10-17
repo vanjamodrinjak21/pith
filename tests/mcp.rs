@@ -1,5 +1,5 @@
 // Needs `test-hooks` (enabled for tests by the self dev-dependency in Cargo.toml).
-#![cfg(all(feature = "mcp", feature = "test-hooks"))]
+#![cfg(all(feature = "mcp", feature = "test-hooks", debug_assertions))]
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};

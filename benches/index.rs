@@ -17,7 +17,7 @@ fn throughput(c: &mut Criterion) {
                 .repeat(10)
         })
         .collect();
-    let mut g = c.benchmark_group("embed_64_chunks_830_chars");
+    let mut g = c.benchmark_group("embed_64_chunks");
     g.sample_size(10)
         .throughput(Throughput::Elements(CHUNKS as u64));
     for batch_size in [8, 16, 32, 64] {
