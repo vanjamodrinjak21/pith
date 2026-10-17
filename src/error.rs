@@ -19,6 +19,8 @@ pub enum Error {
         found: String,
         found_dim: usize,
     },
+    #[error("no Pith index found at or above {0}; run `pith index` first")]
+    NoIndex(String),
     #[error("another writer holds the database lock")]
     Locked,
     #[error("unsupported database format version {0}; run `pith index --reindex`")]
