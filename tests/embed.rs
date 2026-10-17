@@ -121,6 +121,7 @@ fn names(dir: &Path) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
+    v.retain(|n| n != ".pull.lock"); // the (empty) lock file is expected to stay
     v.sort();
     v
 }
@@ -221,8 +222,12 @@ fn pull_rejects_size_mismatch_and_oversize_stream() {
         ),
         ("/unsized/onnx/m.onnx", Reply::Unsized(long.clone())),
         ("/big/onnx/m.onnx", Reply::Body(long, None)),
+        (
+            "/shortunsized/onnx/m.onnx",
+            Reply::Unsized(f.a[..100].to_vec()),
+        ),
     ]);
-    for p in ["short", "unsized", "big"] {
+    for p in ["short", "unsized", "big", "shortunsized"] {
         let d = tempfile::tempdir().unwrap();
         let err = pull_files(d.path(), &format!("{base}/{p}"), &f.files()).unwrap_err();
         assert!(matches!(err, Error::Download(_)), "{p}: {err}");
@@ -320,15 +325,87 @@ fn models_dir_honours_pith_home() {
     // Only this test touches PITH_HOME in this binary.
     std::env::set_var("PITH_HOME", "/tmp/pith-home-test");
     assert_eq!(
-        pithdb::embed::models_dir(),
+        pithdb::embed::models_dir().unwrap(),
         Path::new("/tmp/pith-home-test/models")
     );
     std::env::remove_var("PITH_HOME");
     let home = std::env::var_os("HOME").unwrap();
     assert_eq!(
-        pithdb::embed::models_dir(),
+        pithdb::embed::models_dir().unwrap(),
         Path::new(&home).join(".pith/models")
     );
+    // never a relative path
+    std::env::set_var("HOME", "relative/home");
+    assert!(pithdb::embed::models_dir().is_err());
+    std::env::remove_var("HOME");
+    assert!(pithdb::embed::models_dir().is_err());
+    std::env::set_var("HOME", &home);
+}
+
+#[test]
+fn normalize_survives_huge_values() {
+    let out = cls_pool_normalize(&[3e30, 4e30], 1, 1, 2).unwrap();
+    assert!(
+        (out[0][0] - 0.6).abs() < 1e-6 && (out[0][1] - 0.8).abs() < 1e-6,
+        "{out:?}"
+    );
+    assert!(cls_pool_normalize(&[1.0; 4], usize::MAX, 2, 2).is_err());
+}
+
+#[test]
+fn pull_rejects_unsafe_local_names() {
+    let f = Fixture::new();
+    let d = tempfile::tempdir().unwrap();
+    for local in ["../escape", "a/b", "/abs", ".."] {
+        let mut files = f.files();
+        files[0].local = local;
+        let err = pull_files(&d.path().join("m"), "http://127.0.0.1:1", &files).unwrap_err();
+        assert!(matches!(err, Error::Invalid(_)), "{local}: {err}");
+    }
+    assert!(names(d.path()).is_empty());
+}
+
+#[test]
+fn concurrent_pulls_serialize_and_both_succeed() {
+    let f = Fixture::new();
+    let base = serve(vec![
+        ("/onnx/m.onnx", Reply::Body(f.a.clone(), None)),
+        ("/tok.json", Reply::Body(f.b.clone(), None)),
+    ]);
+    let d = tempfile::tempdir().unwrap();
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..4)
+            .map(|_| s.spawn(|| pull_files(d.path(), &base, &f.files())))
+            .collect();
+        for h in hs {
+            h.join().unwrap().unwrap();
+        }
+    });
+    assert_eq!(names(d.path()), ["m.onnx", "tok.json"]);
+    assert!(d.path().join(".pull.lock").exists());
+    assert_eq!(std::fs::read(d.path().join("m.onnx")).unwrap(), f.a);
+}
+
+#[cfg(unix)]
+#[test]
+fn pull_keeps_existing_dir_mode_and_refuses_symlinked_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let base = serve(vec![
+        ("/onnx/m.onnx", Reply::Body(f.a.clone(), None)),
+        ("/tok.json", Reply::Body(f.b.clone(), None)),
+    ]);
+    let d = tempfile::tempdir().unwrap();
+    let existing = d.path().join("existing");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o750)).unwrap();
+    pull_files(&existing, &base, &f.files()).unwrap();
+    let mode = std::fs::metadata(&existing).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o750);
+    let link = d.path().join("link");
+    std::os::unix::fs::symlink(&existing, &link).unwrap();
+    let err = pull_files(&link, &base, &f.files()).unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "{err}");
 }
 
 #[cfg(feature = "onnx")]
@@ -345,7 +422,7 @@ mod onnx {
         let d = tempfile::tempdir().unwrap();
         let err = OnnxEmbedder::load(d.path()).err().expect("must fail");
         assert!(matches!(err, Error::ModelMissing(_)), "{err}");
-        assert!(err.to_string().contains("pith init"));
+        assert!(err.to_string().contains("pith model pull"));
     }
 
     #[test]
@@ -375,8 +452,28 @@ mod onnx {
         assert!(matches!(err, Error::Integrity(_)), "{err}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_symlinked_model_files() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join(DEFAULT_MODEL.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in &DEFAULT_MODEL.files {
+            let target = d.path().join(format!("real-{}", f.local));
+            std::fs::File::create(&target)
+                .unwrap()
+                .set_len(f.size)
+                .unwrap();
+            std::os::unix::fs::symlink(&target, dir.join(f.local)).unwrap();
+        }
+        let err = OnnxEmbedder::load(d.path()).err().expect("must fail");
+        assert!(matches!(err, Error::Integrity(_)), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
     fn real() -> OnnxEmbedder {
-        OnnxEmbedder::load(&pithdb::embed::models_dir()).expect("run the pull first (see report)")
+        OnnxEmbedder::load(&pithdb::embed::models_dir().unwrap())
+            .expect("run the pull first (see report)")
     }
 
     #[test]
@@ -424,7 +521,7 @@ mod onnx {
         }
         for bs in [1, 2, 32] {
             let e2 = OnnxEmbedder::load_with(
-                &pithdb::embed::models_dir(),
+                &pithdb::embed::models_dir().unwrap(),
                 OnnxConfig {
                     batch_size: bs,
                     ..OnnxConfig::default()
@@ -447,7 +544,7 @@ mod onnx {
     fn real_model_throughput() {
         for (bs, th) in [(1usize, 1usize), (1, 4), (1, 8), (32, 8)] {
             let e = OnnxEmbedder::load_with(
-                &pithdb::embed::models_dir(),
+                &pithdb::embed::models_dir().unwrap(),
                 OnnxConfig {
                     batch_size: bs,
                     threads: th,
@@ -461,6 +558,14 @@ mod onnx {
             let v = e.embed_passages(&texts).unwrap();
             let s = t.elapsed().as_secs_f64();
             assert_eq!(v.len(), 256);
+            assert!(v
+                .iter()
+                .all(|x| x.iter().all(|f| f.is_finite()) && (norm(x) - 1.0).abs() < 1e-5));
+            assert!(
+                256.0 / s > 2.0,
+                "throughput collapsed: {:.2} chunks/s",
+                256.0 / s
+            );
             println!(
                 "batch {bs} threads {th}: {:.1} chunks/s ({} chunks of {} chars)",
                 256.0 / s,
@@ -474,7 +579,7 @@ mod onnx {
 #[test]
 #[ignore = "downloads ~35 MB from Hugging Face into models_dir()"]
 fn pull_default_model_from_hugging_face() {
-    let dir = pithdb::embed::models_dir();
+    let dir = pithdb::embed::models_dir().unwrap();
     pithdb::embed::pull(&dir, DEFAULT_MODEL.base_url).unwrap();
     pithdb::embed::pull(&dir, DEFAULT_MODEL.base_url).unwrap(); // idempotent, no re-download
 }

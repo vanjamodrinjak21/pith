@@ -10,6 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const TEMP_PREFIX: &str = ".pull-";
+const LOCK_NAME: &str = ".pull.lock";
 const MAX_REDIRECTS: usize = 5;
 
 /// Downloads the default model into `models_dir/<model id>` (see [`pull_files`]).
@@ -23,13 +24,25 @@ pub fn pull(models_dir: &Path, base_url: &str) -> Result<()> {
 
 /// Downloads `files` from `base_url/<remote>` into `dir`. Each file is streamed into a fresh
 /// temp file in `dir`, capped at its manifest size, sha256-verified and fsynced; only after every
-/// file verified are they renamed into place. On any failure the temp files are removed and the
-/// existing files are untouched. Files already present with the right hash are not downloaded.
-/// Plain `http` is accepted only for loopback hosts (tests); redirects must stay on https.
+/// file verified are they renamed into place, one rename per file (each rename is atomic, the set
+/// is not; every file on disk is always a complete verified one). On any failure before the
+/// renames the temp files are removed and the existing files are untouched. Files already present
+/// with the right hash are not downloaded. Concurrent pulls into one dir serialize on a lock file.
+/// Plain `http` is accepted only when `base_url` itself is loopback http (tests), and redirects
+/// may never downgrade from https to http.
 pub fn pull_files(dir: &Path, base_url: &str, files: &[ModelFile<'_>]) -> Result<()> {
-    check_url(base_url, false)?;
+    for f in files {
+        check_local_name(f.local)?;
+    }
+    let allow_http = check_url(base_url, false, true)? == "http";
     create_private_dir(dir)?;
-    // shortcut: a concurrent pull into the same dir loses its temp files and fails cleanly; no lock.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK_NAME))?;
+    lock.lock()?; // released on drop; a second pull waits, then finds the files verified
+                  // Under the lock no other pull is live, so every temp file left here is from a crash.
     for e in fs::read_dir(dir)?.flatten() {
         if e.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
             let _ = fs::remove_file(e.path());
@@ -41,6 +54,8 @@ pub fn pull_files(dir: &Path, base_url: &str, files: &[ModelFile<'_>]) -> Result
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
+        // A stalled body cannot hang forever: 35 MB in 15 min needs only ~40 KB/s.
+        .timeout_global(Some(Duration::from_secs(15 * 60)))
         .user_agent(concat!("pith/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
@@ -51,7 +66,7 @@ pub fn pull_files(dir: &Path, base_url: &str, files: &[ModelFile<'_>]) -> Result
             continue;
         }
         let url = format!("{}/{}", base_url.trim_end_matches('/'), f.remote);
-        staged.push((download(&agent, &url, dir, f)?, dest));
+        staged.push((download(&agent, &url, allow_http, dir, f)?, dest));
     }
     for (tmp, dest) in staged {
         tmp.persist(&dest).map_err(|e| e.error)?;
@@ -63,6 +78,7 @@ pub fn pull_files(dir: &Path, base_url: &str, files: &[ModelFile<'_>]) -> Result
 fn download(
     agent: &ureq::Agent,
     url: &str,
+    allow_http: bool,
     dir: &Path,
     f: &ModelFile<'_>,
 ) -> Result<tempfile::NamedTempFile> {
@@ -90,7 +106,7 @@ fn download(
                     ))
                 })?;
             url = join(&url, loc)?;
-            check_url(&url, true)?;
+            check_url(&url, true, allow_http)?;
             continue;
         }
         if !status.is_success() {
@@ -153,27 +169,57 @@ fn download(
 
 /// True if `path` exists with the manifest size and hash.
 fn is_verified(path: &Path, f: &ModelFile<'_>) -> Result<bool> {
-    match fs::metadata(path) {
-        Ok(m) if m.len() == f.size => Ok(sha256_hex(&fs::read(path)?) == f.sha256),
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_file() && m.len() == f.size => {
+            Ok(sha256_hex(&fs::read(path)?) == f.sha256)
+        }
         Ok(_) => Ok(false),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
 
+/// Creates `dir` (and missing parents) with mode 0700. An existing dir keeps its mode; a
+/// symlink at `dir` is refused.
 fn create_private_dir(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    match fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(Error::Invalid(format!(
+                "{} exists and is not a directory (symlinks are refused)",
+                dir.display()
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
-    #[cfg(not(unix))]
-    fs::create_dir_all(dir)?;
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700); // applies only to dirs created here
+    b.create(dir)?;
+    if !fs::symlink_metadata(dir)?.file_type().is_dir() {
+        return Err(Error::Invalid(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
     Ok(())
+}
+
+/// A manifest file name must be a single plain path component.
+fn check_local_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', '\0'])
+        && !name.starts_with(TEMP_PREFIX)
+        && name != LOCK_NAME;
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!("bad model file name {name:?}")))
+    }
 }
 
 pub(super) fn sha256_hex(data: &[u8]) -> String {
@@ -198,8 +244,9 @@ fn split(url: &str) -> Option<(&str, &str)> {
     Some((scheme, rest.split(['/', '?', '#']).next().unwrap_or("")))
 }
 
-/// https anywhere; http only to loopback; no userinfo.
-fn check_url(url: &str, redirect: bool) -> Result<()> {
+/// Returns the scheme of an acceptable URL: https always; http only to a loopback host and only
+/// when `allow_http` (the caller's own base URL was loopback http); never userinfo.
+fn check_url(url: &str, redirect: bool, allow_http: bool) -> Result<&str> {
     let what = if redirect {
         "refusing redirect to"
     } else {
@@ -211,7 +258,8 @@ fn check_url(url: &str, redirect: bool) -> Result<()> {
         return Err(bad("credentials in URLs are not supported"));
     }
     match scheme {
-        "https" if !authority.is_empty() => Ok(()),
+        "https" if !authority.is_empty() => Ok(scheme),
+        "http" if !allow_http => Err(bad("plain http is not allowed")),
         "http" => {
             let host = match authority.strip_prefix('[') {
                 Some(v6) => v6.split(']').next().unwrap_or(""),
@@ -221,7 +269,7 @@ fn check_url(url: &str, redirect: bool) -> Result<()> {
                 || host == "::1"
                 || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback());
             if loopback {
-                Ok(())
+                Ok(scheme)
             } else {
                 Err(bad("plain http is only allowed to loopback"))
             }
@@ -244,5 +292,64 @@ fn join(base: &str, loc: &str) -> Result<String> {
             "unsupported relative redirect from {}",
             redact(base)
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn https_never_downgrades_to_http_even_loopback() {
+        let allow = check_url("https://huggingface.co/x", false, true).unwrap() == "http";
+        assert!(!allow);
+        for to in [
+            "http://127.0.0.1/m",
+            "http://localhost:8080/m",
+            "http://[::1]/m",
+        ] {
+            let err = check_url(to, true, allow).unwrap_err();
+            assert!(err.to_string().contains("refusing redirect"), "{err}");
+        }
+        assert!(check_url("https://cdn.example/m", true, allow).is_ok());
+        // loopback-http base (tests) may redirect within loopback, never off it
+        assert!(check_url("http://127.0.0.1:9/m", true, true).is_ok());
+        assert!(check_url("http://example.com/m", true, true).is_err());
+    }
+
+    #[test]
+    fn redirect_joins() {
+        let b = "https://huggingface.co/a/resolve/x/f?q=1";
+        assert_eq!(
+            join(b, "https://cdn.hf.co/p?s=2").unwrap(),
+            "https://cdn.hf.co/p?s=2"
+        );
+        assert_eq!(join(b, "//cdn.hf.co/p").unwrap(), "https://cdn.hf.co/p");
+        assert_eq!(join(b, "/api/p").unwrap(), "https://huggingface.co/api/p");
+        assert_eq!(
+            join("http://127.0.0.1:5/x", "/y").unwrap(),
+            "http://127.0.0.1:5/y"
+        );
+        assert!(join(b, "relative/p").is_err());
+        // a scheme-relative join keeps https, so it can never become a downgrade
+        assert!(check_url(&join(b, "//127.0.0.1/p").unwrap(), true, false).is_ok());
+    }
+
+    #[test]
+    fn local_names_must_be_plain() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../x",
+            "/etc/passwd",
+            "a\\b",
+            ".pull-x",
+            ".pull.lock",
+        ] {
+            assert!(check_local_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_local_name("tokenizer.json").is_ok());
     }
 }

@@ -24,23 +24,36 @@ pub trait Embedder {
     fn embed_query(&self, text: &str) -> Result<Vec<f32>>;
 }
 
-/// `$PITH_HOME/models`, else `$HOME/.pith/models`. Pure: creating it is `pull`'s job.
-pub fn models_dir() -> PathBuf {
-    match std::env::var_os("PITH_HOME") {
-        Some(h) if !h.is_empty() => PathBuf::from(h).join("models"),
-        _ => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".pith/models"),
+/// `$PITH_HOME/models`, else `$HOME/.pith/models`. Pure: creating it is `pull`'s job. Errors
+/// rather than return a relative path when neither variable holds an absolute path.
+pub fn models_dir() -> Result<PathBuf> {
+    let (base, sub) = match std::env::var_os("PITH_HOME") {
+        Some(h) if !h.is_empty() => (PathBuf::from(h), "models"),
+        _ => (
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
+            ".pith/models",
+        ),
+    };
+    if !base.is_absolute() {
+        return Err(Error::Invalid(
+            "cannot locate the models directory: set PITH_HOME or HOME to an absolute path".into(),
+        ));
     }
+    Ok(base.join(sub))
 }
 
-/// Scales `v` to unit length; rejects NaN/inf and all-zero vectors.
+/// Scales `v` to unit length; rejects NaN/inf and all-zero vectors. Divides by the max magnitude
+/// first so the sum of squares cannot overflow.
 fn normalize(v: &mut [f32]) -> Result<()> {
     if !v.iter().all(|x| x.is_finite()) {
         return Err(Error::NonFinite);
     }
-    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if n == 0.0 {
+    let max = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    if max == 0.0 {
         return Err(Error::EmptyVector);
     }
+    v.iter_mut().for_each(|x| *x /= max);
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt(); // in [1, sqrt(len)]
     v.iter_mut().for_each(|x| *x /= n);
     Ok(())
 }
@@ -52,7 +65,8 @@ pub fn cls_pool_normalize(
     seq: usize,
     dim: usize,
 ) -> Result<Vec<Vec<f32>>> {
-    if seq == 0 || hidden.len() != batch * seq * dim {
+    let want = batch.checked_mul(seq).and_then(|n| n.checked_mul(dim));
+    if seq == 0 || dim == 0 || want != Some(hidden.len()) {
         return Err(Error::Embed(format!(
             "hidden state has {} values, expected {batch}x{seq}x{dim}",
             hidden.len()

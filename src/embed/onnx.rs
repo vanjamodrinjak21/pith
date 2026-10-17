@@ -16,8 +16,9 @@ const QUERY_PREFIX: &str = "Represent this sentence for searching relevant passa
 const MAX_TOKENS: usize = 512;
 
 /// `batch_size` defaults to 1: the int8 model quantizes activations dynamically with scales shared
-/// across the whole batch, so batched results depend on batch neighbours (measured max component
-/// diff ~1e-2), and on this CPU batching gave no throughput gain. Larger batches remain available.
+/// across the whole batch, so batched results depend on batch neighbours (measured cosine to the
+/// batch-1 vector ~0.996-0.9995), and on this CPU batching gave no throughput gain. The batch size
+/// is not part of `model_id`, so a database must be indexed and queried with the same value.
 #[derive(Debug, Clone, Copy)]
 pub struct OnnxConfig {
     pub batch_size: usize,
@@ -67,23 +68,45 @@ fn environment() -> Result<Environment> {
     Ok(e)
 }
 
+/// Reads a file without following a symlink at its final component.
+fn read_no_follow(p: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut o,
+        rustix::fs::OFlags::NOFOLLOW.bits() as i32,
+    );
+    let mut data = Vec::new();
+    o.open(p)?.read_to_end(&mut data)?;
+    Ok(data)
+}
+
 impl OnnxEmbedder {
     pub fn load(models_dir: &Path) -> Result<Self> {
         Self::load_with(models_dir, OnnxConfig::default())
     }
 
-    /// Verifies size, then sha256 of both files (~20 ms for the 34 MB model in a release build on
+    /// Vectors depend slightly on `cfg.batch_size` (see [`OnnxConfig`]): index and query with the
+    /// same value. Verifies size, then sha256 of both files (~20 ms for the 34 MB model in a release build on
     /// an M4 Pro, measured), so a corrupted or swapped file is never loaded. Offline.
     pub fn load_with(models_dir: &Path, cfg: OnnxConfig) -> Result<Self> {
         let dir = models_dir.join(DEFAULT_MODEL.id);
         let mut bytes = Vec::new();
         for f in &DEFAULT_MODEL.files {
             let p = dir.join(f.local);
-            match std::fs::metadata(&p) {
+            match std::fs::symlink_metadata(&p) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Err(Error::ModelMissing(p.display().to_string()))
                 }
                 Err(e) => return Err(e.into()),
+                Ok(m) if !m.file_type().is_file() => {
+                    return Err(Error::Integrity(format!(
+                        "{} is not a regular file (symlinks are refused); run `pith model pull`",
+                        p.display()
+                    )))
+                }
                 Ok(m) if m.len() != f.size => {
                     return Err(Error::Integrity(format!(
                         "{} is {} bytes, expected {}; run `pith model pull`",
@@ -94,7 +117,7 @@ impl OnnxEmbedder {
                 }
                 Ok(_) => {}
             }
-            let data = std::fs::read(&p)?;
+            let data = read_no_follow(&p)?;
             if sha256_hex(&data) != f.sha256 {
                 return Err(Error::Integrity(format!(
                     "{} has the wrong sha256; run `pith model pull`",
@@ -185,10 +208,11 @@ impl OnnxEmbedder {
                 .get("last_hidden_state")
                 .ok_or_else(|| oe("model has no last_hidden_state output"))?;
             let (s, data) = hidden.try_extract_tensor::<f32>().map_err(oe)?;
-            if s.len() != 3 || s[0] as usize != b || s[2] as usize != dim {
+            let dims: Vec<usize> = s.iter().filter_map(|&d| usize::try_from(d).ok()).collect();
+            if dims.len() != 3 || s.len() != 3 || dims[0] != b || dims[2] != dim {
                 return Err(oe(format!("unexpected output shape {s:?}")));
             }
-            let vecs = cls_pool_normalize(data, b, s[1] as usize, dim)?;
+            let vecs = cls_pool_normalize(data, b, dims[1], dim)?;
             for (&i, v) in idxs.iter().zip(vecs) {
                 out[i] = v;
             }
