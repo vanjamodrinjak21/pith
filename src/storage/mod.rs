@@ -1,6 +1,14 @@
 //! Single-file database (layout in `format.rs`). Writes replace the whole file
-//! atomically (temp file, fsync, rename, fsync dir) under the writer lock; the file
-//! is never modified in place, so readers always see a complete old or new file.
+//! atomically (unique temp file, fsync, rename, fsync dir) under the writer lock;
+//! Pith never modifies a database file in place, so a reader sees a complete old or
+//! new file. Vectors stay in a shared read-only mapping for the life of the index.
+//!
+//! Unsupported: another process modifying or truncating a database file in place
+//! while it is open. Modification after `open` is not detected; truncation makes
+//! reads of the mapping raise SIGBUS (inherent to mmap; accepted trade-off).
+//!
+//! Windows (best-effort): replacing a file that a reader has mapped fails there, so
+//! a write can fail while any `Db` or `VectorIndex` from that file is alive.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -8,14 +16,15 @@ mod format;
 mod locate;
 mod lock;
 
-pub use locate::locate_project;
+pub use locate::{locate_project, locate_project_within};
 pub use lock::WriterLock;
 
 use crate::index::VectorIndex;
 use crate::{Error, Result};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredChunk {
@@ -38,30 +47,30 @@ pub struct Db {
     index: VectorIndex,
 }
 
-/// Read-only mapping of the whole file. The only `unsafe` in storage.
+/// Read-only shared mapping of the whole file. The only `unsafe` in storage.
 fn map_readonly(file: &File) -> Result<memmap2::Mmap> {
-    // SAFETY: Pith never modifies a database file in place: writers build a new file
-    // and rename it over the old path, which leaves this inode (and so this mapping)
-    // untouched. The mapping is read-only and is dropped before `Db::open` returns
-    // (validated data is copied out). The remaining hazard is an external process
-    // truncating or writing the same inode during that short window: a write can
-    // only change bytes (caught by the checksums or, if after validation, copied as
-    // is), while a truncation can raise SIGBUS. That cannot be prevented with a
-    // shared mapping and is documented as unsupported.
+    // SAFETY: memmap2 requires that the file is not modified or truncated while
+    // mapped. Pith guarantees this for its own writes: a database file is never
+    // modified in place, only replaced by renaming a new file over its path, which
+    // leaves the mapped inode untouched. Nothing protects against another process
+    // writing or truncating the same inode; that is unsupported (see module docs):
+    // a write is not detected after `open` validated the file, and a truncation
+    // makes later reads raise SIGBUS.
     Ok(unsafe { memmap2::Mmap::map(file)? })
 }
 
 impl Db {
     /// Opens and fully validates the file. `expect` is (model id, dim); a mismatch
-    /// is `Error::ModelMismatch`. Never panics on corrupt input.
+    /// is `Error::ModelMismatch`. Never panics on corrupt input. The vectors stay
+    /// mapped; the mapping lives as long as this `Db` or its index.
     pub fn open(path: &Path, expect: Option<(&str, usize)>) -> Result<Db> {
         let file = File::open(path)?;
-        // Mapping an empty file fails on some platforms; let decode report it.
-        let d = if file.metadata()?.len() < format::HEADER_LEN as u64 {
-            format::decode(&fs::read(path)?)?
-        } else {
-            format::decode(&map_readonly(&file)?)?
-        };
+        let len = file.metadata()?.len();
+        // Too short to be valid; also avoids mapping an empty file.
+        if len < format::MIN_LEN as u64 {
+            return Err(Error::CorruptDb(format!("file is {len} bytes, too short")));
+        }
+        let d = format::decode(Arc::new(map_readonly(&file)?))?;
         if let Some((model, dim)) = expect {
             if d.model_id != model || d.index.dim() != dim {
                 return Err(Error::ModelMismatch {
@@ -82,7 +91,12 @@ impl Db {
 
     /// Atomically replaces `path`. Chunk `i` belongs to vector `i`. For an empty
     /// database pass `VectorIndex::from_parts(model_dim, vec![], vec![])` so the
-    /// dimension is recorded.
+    /// dimension is recorded; a dimension of 0 is `Error::Invalid`.
+    ///
+    /// On any error before the rename, `path` is untouched and the temp file is
+    /// removed. The rename is the commit point: if only the directory fsync after it
+    /// fails, the new file is already in place (but may not survive power loss) and
+    /// `Err` is returned. Either way `path` holds a complete old or new database.
     pub fn write(
         path: &Path,
         model_id: &str,
@@ -90,45 +104,7 @@ impl Db {
         index: &VectorIndex,
         meta: IndexMeta,
     ) -> Result<()> {
-        Self::write_with_hook(path, model_id, chunks, index, meta, || Ok(()))
-    }
-
-    /// `write` with a hook run after the temp file is synced and before the rename;
-    /// an error from it aborts the write. For failure-injection tests.
-    #[doc(hidden)]
-    pub fn write_with_hook(
-        path: &Path,
-        model_id: &str,
-        chunks: Vec<StoredChunk>,
-        index: &VectorIndex,
-        meta: IndexMeta,
-        before_rename: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
-        let bytes = format::encode(model_id, &chunks, index, &meta)?;
-        let _lock = WriterLock::acquire(path)?;
-        let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-        tmp_name.push(".tmp");
-        let tmp = path.with_file_name(tmp_name);
-        // The lock makes us the only writer, so a fixed temp name is safe; a stale one
-        // from a killed writer is simply overwritten.
-        let result = (|| {
-            let mut f = File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-            before_rename()?;
-            fs::rename(&tmp, path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
-            return result;
-        }
-        #[cfg(unix)]
-        {
-            let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-            File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
-        }
-        Ok(())
+        write_inner(path, model_id, &chunks, index, &meta, || Ok(()))
     }
 
     pub fn chunk(&self, id: u32) -> Option<&StoredChunk> {
@@ -137,6 +113,11 @@ impl Db {
 
     pub fn index(&self) -> &VectorIndex {
         &self.index
+    }
+
+    /// Takes the index out; it keeps the mapping alive after the `Db` is gone.
+    pub fn into_index(self) -> VectorIndex {
+        self.index
     }
 
     pub fn meta(&self) -> &IndexMeta {
@@ -148,9 +129,38 @@ impl Db {
     }
 }
 
+/// `before_rename` runs after the temp file is synced; an error aborts the write.
+fn write_inner(
+    path: &Path,
+    model_id: &str,
+    chunks: &[StoredChunk],
+    index: &VectorIndex,
+    meta: &IndexMeta,
+    before_rename: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let _lock = WriterLock::acquire(path)?;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut prefix = path.file_name().unwrap_or_default().to_os_string();
+    prefix.push(".tmp");
+    // Random name created with O_EXCL, so a planted file or symlink is never
+    // followed. Deleted on drop, i.e. on every early return.
+    let tmp = tempfile::Builder::new().prefix(&prefix).tempfile_in(dir)?;
+    format::encode(BufWriter::new(tmp.as_file()), model_id, chunks, index, meta)?;
+    tmp.as_file().sync_all()?;
+    before_rename()?;
+    tmp.persist(path).map_err(|e| Error::Io(e.error))?;
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn map_readonly_matches_file_and_survives_replace_by_rename() {
@@ -165,5 +175,36 @@ mod tests {
         fs::write(&other, b"new").unwrap();
         fs::rename(&other, &p).unwrap();
         assert_eq!(&map[..], &data[..]);
+    }
+
+    #[test]
+    fn failed_write_leaves_previous_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".pith");
+        let one = |dim| VectorIndex::build(vec![vec![0.5; dim]]).unwrap();
+        let c = StoredChunk {
+            path: "a".into(),
+            start_line: 1,
+            end_line: 2,
+            text: "t".into(),
+        };
+        let meta = IndexMeta {
+            indexed_at_unix: 1,
+            git_head: None,
+        };
+        Db::write(&path, "old", vec![c.clone()], &one(4), meta.clone()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let r = write_inner(&path, "new", &[c], &one(4), &meta, || {
+            Err(Error::Io(std::io::Error::other("injected")))
+        });
+        assert!(matches!(r, Err(Error::Io(e)) if e.to_string() == "injected"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(Db::open(&path, None).unwrap().model_id(), "old");
+        let mut names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, [".pith", ".pith.lock"], "temp file left behind");
     }
 }

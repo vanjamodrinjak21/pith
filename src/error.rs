@@ -25,6 +25,8 @@ pub enum Error {
     UnsupportedFormat(u32),
     #[error("corrupt database: {0}")]
     CorruptDb(String),
+    #[error("invalid input: {0}")]
+    Invalid(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
