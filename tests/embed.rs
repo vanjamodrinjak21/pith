@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 fn norm(v: &[f32]) -> f32 {
@@ -32,6 +33,13 @@ enum Reply {
 
 /// Minimal HTTP/1.1 server: maps request path to a reply; 404 otherwise. Serves until dropped.
 fn serve(routes: Vec<(&'static str, Reply)>) -> String {
+    serve_logged(routes).0
+}
+
+/// Like [`serve`], also returning the log of requested paths.
+fn serve_logged(routes: Vec<(&'static str, Reply)>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log2 = log.clone();
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
     thread::spawn(move || {
@@ -43,6 +51,7 @@ fn serve(routes: Vec<(&'static str, Reply)>) -> String {
                 continue;
             }
             let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+            log2.lock().unwrap().push(path.clone());
             loop {
                 let mut h = String::new();
                 if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
@@ -75,7 +84,7 @@ fn serve(routes: Vec<(&'static str, Reply)>) -> String {
             let _ = r.read_to_end(&mut sink);
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), log)
 }
 
 struct Fixture {
@@ -226,8 +235,13 @@ fn pull_rejects_size_mismatch_and_oversize_stream() {
             "/shortunsized/onnx/m.onnx",
             Reply::Unsized(f.a[..100].to_vec()),
         ),
+        // honest-looking Content-Length, then the connection drops mid-body
+        (
+            "/midstream/onnx/m.onnx",
+            Reply::Body(f.a[..f.a.len() / 2].to_vec(), Some(f.a.len())),
+        ),
     ]);
-    for p in ["short", "unsized", "big", "shortunsized"] {
+    for p in ["short", "unsized", "big", "shortunsized", "midstream"] {
         let d = tempfile::tempdir().unwrap();
         let err = pull_files(d.path(), &format!("{base}/{p}"), &f.files()).unwrap_err();
         assert!(matches!(err, Error::Download(_)), "{p}: {err}");
@@ -252,13 +266,19 @@ fn pull_rejects_plain_http_to_non_loopback_and_https_downgrade() {
         let err = pull_files(d.path(), base, &f.files()).unwrap_err();
         assert!(matches!(err, Error::Download(_)), "{base}: {err}");
     }
-    let base = serve(vec![(
-        "/onnx/m.onnx",
-        Reply::Redirect("http://example.com/m.onnx".into()),
-    )]);
-    let err = pull_files(d.path(), &base, &f.files()).unwrap_err();
-    assert!(err.to_string().contains("redirect"), "{err}");
-    assert!(names(d.path()).is_empty());
+    // End to end through download(): redirects off loopback over plain http are refused before
+    // any connection is made to the target.
+    for (to, route) in [
+        ("http://example.com/m.onnx", "/a/onnx/m.onnx"),
+        ("http://192.168.1.1/m.onnx", "/b/onnx/m.onnx"),
+        ("ftp://127.0.0.1/m.onnx", "/c/onnx/m.onnx"),
+    ] {
+        let base = serve(vec![(route, Reply::Redirect(to.into()))]);
+        let prefix = &route[..2];
+        let err = pull_files(d.path(), &format!("{base}{prefix}"), &f.files()).unwrap_err();
+        assert!(err.to_string().contains("refusing redirect"), "{to}: {err}");
+        assert!(names(d.path()).is_empty());
+    }
 }
 
 #[test]
@@ -368,7 +388,7 @@ fn pull_rejects_unsafe_local_names() {
 #[test]
 fn concurrent_pulls_serialize_and_both_succeed() {
     let f = Fixture::new();
-    let base = serve(vec![
+    let (base, log) = serve_logged(vec![
         ("/onnx/m.onnx", Reply::Body(f.a.clone(), None)),
         ("/tok.json", Reply::Body(f.b.clone(), None)),
     ]);
@@ -384,6 +404,19 @@ fn concurrent_pulls_serialize_and_both_succeed() {
     assert_eq!(names(d.path()), ["m.onnx", "tok.json"]);
     assert!(d.path().join(".pull.lock").exists());
     assert_eq!(std::fs::read(d.path().join("m.onnx")).unwrap(), f.a);
+    // With the lock, later pulls find verified files: each file is fetched exactly once.
+    let mut got = log.lock().unwrap().clone();
+    got.sort();
+    assert_eq!(got, ["/onnx/m.onnx", "/tok.json"]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(d.path().join(".pull.lock"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 }
 
 #[cfg(unix)]
@@ -466,6 +499,24 @@ mod onnx {
                 .unwrap();
             std::os::unix::fs::symlink(&target, dir.join(f.local)).unwrap();
         }
+        let err = OnnxEmbedder::load(d.path()).err().expect("must fail");
+        assert!(matches!(err, Error::Integrity(_)), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_symlinked_model_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let real_dir = d.path().join("elsewhere");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        for f in &DEFAULT_MODEL.files {
+            std::fs::File::create(real_dir.join(f.local))
+                .unwrap()
+                .set_len(f.size)
+                .unwrap();
+        }
+        std::os::unix::fs::symlink(&real_dir, d.path().join(DEFAULT_MODEL.id)).unwrap();
         let err = OnnxEmbedder::load(d.path()).err().expect("must fail");
         assert!(matches!(err, Error::Integrity(_)), "{err}");
         assert!(err.to_string().contains("symlink"), "{err}");
@@ -562,7 +613,7 @@ mod onnx {
                 .iter()
                 .all(|x| x.iter().all(|f| f.is_finite()) && (norm(x) - 1.0).abs() < 1e-5));
             assert!(
-                256.0 / s > 2.0,
+                256.0 / s >= 10.0, // floor far below the measured ~45/s; run with --release
                 "throughput collapsed: {:.2} chunks/s",
                 256.0 / s
             );

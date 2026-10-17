@@ -89,10 +89,24 @@ impl OnnxEmbedder {
     }
 
     /// Vectors depend slightly on `cfg.batch_size` (see [`OnnxConfig`]): index and query with the
-    /// same value. Verifies size, then sha256 of both files (~20 ms for the 34 MB model in a release build on
-    /// an M4 Pro, measured), so a corrupted or swapped file is never loaded. Offline.
+    /// same value. Verifies size, then sha256 of both files (~20 ms for the 34 MB model in a
+    /// release build on an M4 Pro, measured), so a corrupted or swapped file is never loaded.
+    /// Symlinked model directories and files are refused. Offline.
     pub fn load_with(models_dir: &Path, cfg: OnnxConfig) -> Result<Self> {
         let dir = models_dir.join(DEFAULT_MODEL.id);
+        match std::fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::ModelMissing(dir.display().to_string()))
+            }
+            Err(e) => return Err(e.into()),
+            Ok(m) if !m.file_type().is_dir() => {
+                return Err(Error::Integrity(format!(
+                    "{} is not a directory (symlinks are refused); run `pith model pull`",
+                    dir.display()
+                )))
+            }
+            Ok(_) => {}
+        }
         let mut bytes = Vec::new();
         for f in &DEFAULT_MODEL.files {
             let p = dir.join(f.local);
