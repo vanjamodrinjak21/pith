@@ -21,7 +21,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[test]
-fn index_search_matches_naive_f32_top_k() {
+fn search_matches_naive_f32_top_k() {
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let data: Vec<Vec<f32>> = (0..2000).map(|_| rng.unit(384)).collect();
     let idx = VectorIndex::build(data.clone()).unwrap();
@@ -41,7 +41,7 @@ fn index_search_matches_naive_f32_top_k() {
 }
 
 #[test]
-fn index_k_larger_than_len_returns_all() {
+fn k_larger_than_len_returns_all() {
     let mut rng = Rng(7);
     let idx = VectorIndex::build((0..5).map(|_| rng.unit(8)).collect()).unwrap();
     let hits = idx.search(&rng.unit(8), 100);
@@ -50,19 +50,19 @@ fn index_k_larger_than_len_returns_all() {
 }
 
 #[test]
-fn index_empty_index_returns_empty() {
+fn empty_index_returns_empty() {
     let idx = VectorIndex::build(vec![]).unwrap();
     assert!(idx.is_empty());
     assert!(idx.search(&[1.0, 0.0], 5).is_empty());
 }
 
 #[test]
-fn index_ragged_dims_rejected() {
+fn ragged_dims_rejected() {
     assert!(VectorIndex::build(vec![vec![1.0, 0.0], vec![1.0]]).is_err());
 }
 
 #[test]
-fn index_from_parts_roundtrip() {
+fn from_parts_roundtrip() {
     let mut rng = Rng(11);
     let idx = VectorIndex::build((0..20).map(|_| rng.unit(16)).collect()).unwrap();
     let back = VectorIndex::from_parts(16, idx.quantized().to_vec(), idx.full().to_vec()).unwrap();
@@ -72,21 +72,21 @@ fn index_from_parts_roundtrip() {
 }
 
 #[test]
-fn index_huge_k_is_bounded() {
+fn huge_k_is_bounded() {
     let mut rng = Rng(3);
     let idx = VectorIndex::build((0..10).map(|_| rng.unit(8)).collect()).unwrap();
     assert_eq!(idx.search(&rng.unit(8), usize::MAX).len(), 10);
 }
 
 #[test]
-fn index_k_zero_returns_empty() {
+fn k_zero_returns_empty() {
     let mut rng = Rng(5);
     let idx = VectorIndex::build((0..10).map(|_| rng.unit(8)).collect()).unwrap();
     assert!(idx.search(&rng.unit(8), 0).is_empty());
 }
 
 #[test]
-fn index_ties_ordered_by_id() {
+fn ties_ordered_by_id() {
     let v = vec![1.0f32, 0.0];
     let idx = VectorIndex::build(vec![v.clone(), vec![0.0, 1.0], v.clone(), v.clone()]).unwrap();
     let ids: Vec<u32> = idx.search(&v, 4).iter().map(|h| h.id).collect();
@@ -94,7 +94,7 @@ fn index_ties_ordered_by_id() {
 }
 
 #[test]
-fn index_non_finite_rejected() {
+fn non_finite_rejected() {
     for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         assert!(matches!(
             VectorIndex::build(vec![vec![1.0, 0.0], vec![bad, 0.0]]),
@@ -108,12 +108,12 @@ fn index_non_finite_rejected() {
 }
 
 #[test]
-fn index_zero_length_rows_rejected() {
+fn zero_length_rows_rejected() {
     assert!(VectorIndex::build(vec![vec![], vec![]]).is_err());
 }
 
 #[test]
-fn index_try_search_errors() {
+fn try_search_errors() {
     let idx = VectorIndex::build(vec![vec![1.0, 0.0]]).unwrap();
     assert!(matches!(
         idx.try_search(&[1.0, 0.0, 0.0], 1),
@@ -133,7 +133,7 @@ fn index_try_search_errors() {
 
 /// Clustered data with a few outlier-heavy dims, which stresses the shared int8 scale.
 #[test]
-fn index_recall_on_anisotropic_clustered_data() {
+fn recall_on_anisotropic_clustered_data() {
     let dim = 384;
     let mut rng = Rng(0xDEADBEEF);
     let centers: Vec<Vec<f32>> = (0..16).map(|_| rng.unit(dim)).collect();
@@ -165,4 +165,42 @@ fn index_recall_on_anisotropic_clustered_data() {
     let recall = found as f64 / 500.0;
     println!("recall@10 = {recall}");
     assert!(recall >= 0.99, "recall@10 = {recall}");
+}
+
+#[test]
+fn from_parts_rejects_flipped_quantized_byte() {
+    let mut rng = Rng(13);
+    let idx = VectorIndex::build((0..4).map(|_| rng.unit(16)).collect()).unwrap();
+    let mut q = idx.quantized().to_vec();
+    q[5] = q[5].wrapping_add(1);
+    assert!(matches!(
+        VectorIndex::from_parts(16, q, idx.full().to_vec()),
+        Err(Error::CorruptIndex(_))
+    ));
+}
+
+#[test]
+fn all_zero_vector_is_indexed_with_zero_score() {
+    let idx = VectorIndex::build(vec![vec![0.0; 4], vec![1.0, 0.0, 0.0, 0.0]]).unwrap();
+    let hits = idx.search(&[1.0, 0.0, 0.0, 0.0], 2);
+    assert_eq!(hits[0].id, 1);
+    assert_eq!(hits[1], pithdb::index::Hit { id: 0, score: 0.0 });
+}
+
+#[test]
+fn dim_not_multiple_of_16_matches_naive() {
+    let mut rng = Rng(17);
+    let data: Vec<Vec<f32>> = (0..300).map(|_| rng.unit(100)).collect();
+    let idx = VectorIndex::build(data.clone()).unwrap();
+    for _ in 0..10 {
+        let q = rng.unit(100);
+        let mut naive: Vec<(u32, f32)> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, dot(&q, v)))
+            .collect();
+        naive.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let got: Vec<u32> = idx.search(&q, 5).iter().map(|h| h.id).collect();
+        assert_eq!(got, naive[..5].iter().map(|h| h.0).collect::<Vec<_>>());
+    }
 }

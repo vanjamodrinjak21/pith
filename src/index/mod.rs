@@ -75,6 +75,11 @@ impl VectorIndex {
         }
         check_parts(dim, &full)?;
         let scale = quant::scale_for(&full);
+        if quant::quantize(&full, scale) != quantized {
+            return Err(Error::CorruptIndex(
+                "quantized data does not match full vectors".into(),
+            ));
+        }
         Ok(Self {
             dim,
             quantized,
@@ -108,12 +113,14 @@ impl VectorIndex {
     }
 
     /// Like [`try_search`](Self::try_search), but returns empty on a dimension
-    /// mismatch or a non-finite query.
+    /// mismatch or a non-finite query. The query must be L2-normalized so the
+    /// dot product equals cosine.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<Hit> {
         self.try_search(query, k).unwrap_or_default()
     }
 
     /// Top `min(k, len)` hits by cosine, descending (ties by ascending id).
+    /// The query must be L2-normalized so the dot product equals cosine.
     pub fn try_search(&self, query: &[f32], k: usize) -> Result<Vec<Hit>> {
         if self.is_empty() || k == 0 {
             return Ok(Vec::new());
@@ -127,19 +134,22 @@ impl VectorIndex {
         if query.iter().any(|x| !x.is_finite()) {
             return Err(Error::NonFinite);
         }
+        debug_assert!(
+            (query.iter().map(|x| x * x).sum::<f32>().sqrt() - 1.0).abs() < 1e-3,
+            "query must be L2-normalized"
+        );
         let q8 = quant::quantize(query, self.scale);
         let cap = k.saturating_mul(CANDIDATE_MULT).max(32).min(self.len());
         // Min-heap of the best `cap` int8 scores.
         let mut heap: BinaryHeap<Reverse<(i32, u32)>> = BinaryHeap::with_capacity(cap + 1);
-        for (id, row) in self.quantized.chunks_exact(self.dim).enumerate() {
-            let s = kernel::dot_i8(&q8, row);
+        kernel::dot_i8_rows(&q8, &self.quantized, |id, s| {
             if heap.len() < cap {
                 heap.push(Reverse((s, id as u32)));
             } else if s > heap.peek().unwrap().0 .0 {
                 heap.pop();
                 heap.push(Reverse((s, id as u32)));
             }
-        }
+        });
         let mut hits: Vec<Hit> = heap
             .into_iter()
             .map(|Reverse((_, id))| {
