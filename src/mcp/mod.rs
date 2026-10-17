@@ -17,6 +17,10 @@ use std::time::{Duration, Instant, SystemTime};
 /// The embedder is dropped after this long without a query.
 const IDLE_UNLOAD: Duration = Duration::from_secs(5 * 60);
 
+/// Longest accepted stdin line (one JSON-RPC message). rmcp's stdio reader has no bound, so
+/// [`LineCap`] ends the session on a longer line instead of buffering it without limit.
+const MAX_LINE: usize = 1 << 20;
+
 type Loaded = Box<dyn Embedder + Send>;
 
 /// Database identity: a reindex replaces the file, so path, size or mtime change.
@@ -34,6 +38,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl State {
+    fn new(start: PathBuf) -> State {
+        State {
+            start,
+            db: Mutex::new(None),
+            embedder: Mutex::new(None),
+        }
+    }
+
     /// Runs `f` with the project root and its database, reopening it when the file changed.
     /// The project is located again on every call, so indexing later needs no restart.
     pub(crate) fn with_db<T>(&self, f: impl FnOnce(&Path, &Db) -> Result<T>) -> Result<T> {
@@ -63,16 +75,18 @@ impl State {
         f(e.as_ref())
     }
 
-    fn unload_if_idle(&self) {
+    fn unload_if_idle(&self, idle: Duration) {
         let mut g = lock(&self.embedder);
-        if g.as_ref().is_some_and(|(_, t)| t.elapsed() >= IDLE_UNLOAD) {
+        if g.as_ref().is_some_and(|(_, t)| t.elapsed() >= idle) {
             *g = None;
         }
     }
 }
 
 fn load_embedder() -> Result<Loaded> {
-    // Test hook (documented): integration tests drive the real binary without the ONNX model.
+    // Test hook, compiled only with the non-default `test-hooks` feature: integration tests
+    // drive the real binary without the ONNX model.
+    #[cfg(feature = "test-hooks")]
     if std::env::var_os("PITH_TEST_FAKE_EMBEDDER").is_some_and(|v| v == "1") {
         return Ok(Box::new(crate::embed::FakeEmbedder));
     }
@@ -81,7 +95,10 @@ fn load_embedder() -> Result<Loaded> {
         &crate::embed::models_dir()?,
     )?));
     #[cfg(not(feature = "onnx"))]
-    return crate::load_default_embedder().map(|_| unreachable!("always errors without onnx"));
+    return Err(Error::Invalid(
+        "this build of pith has no embedding model support (built without the `onnx` feature)"
+            .into(),
+    ));
 }
 
 /// Serves MCP over stdio until the client closes stdin. The project is `project` or the current
@@ -97,20 +114,103 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
             start.display()
         )));
     }
-    let state = Arc::new(State {
-        start,
-        db: Mutex::new(None),
-        embedder: Mutex::new(None),
-    });
+    let state = Arc::new(State::new(start));
     let weak = Arc::downgrade(&state);
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(30));
         match weak.upgrade() {
-            Some(s) => s.unload_if_idle(),
+            Some(s) => s.unload_if_idle(IDLE_UNLOAD),
             None => return,
         }
     });
     tokio::runtime::Builder::new_current_thread()
         .build()?
-        .block_on(tools::serve(state))
+        .block_on(tools::serve(state, MAX_LINE))
+}
+
+/// AsyncRead wrapper that fails once more than `max` bytes arrive without a newline.
+pub(crate) struct LineCap<R> {
+    inner: R,
+    max: usize,
+    run: usize,
+}
+
+impl<R> LineCap<R> {
+    pub(crate) fn new(inner: R, max: usize) -> Self {
+        LineCap { inner, max, run: 0 }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineCap<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = r {
+            let new = &buf.filled()[before..];
+            let mut run = self.run;
+            for (i, seg) in new.split(|&b| b == b'\n').enumerate() {
+                run = if i == 0 { run + seg.len() } else { seg.len() };
+                if run > self.max {
+                    buf.set_filled(before);
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "MCP message longer than the line limit",
+                    )));
+                }
+            }
+            self.run = run;
+        }
+        r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embed::FakeEmbedder;
+
+    #[test]
+    fn unload_if_idle_respects_the_boundary() {
+        let s = State::new(PathBuf::from("."));
+        *lock(&s.embedder) = Some((Box::new(FakeEmbedder), Instant::now()));
+        s.unload_if_idle(Duration::from_secs(3600));
+        assert!(lock(&s.embedder).is_some(), "not idle long enough");
+        s.unload_if_idle(Duration::ZERO);
+        assert!(lock(&s.embedder).is_none(), "idle past the limit");
+    }
+
+    #[test]
+    fn reindex_is_picked_up_without_restart() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "one\n").unwrap();
+        crate::index_project(d.path(), &FakeEmbedder, false).unwrap();
+        let s = State::new(d.path().to_path_buf());
+        assert_eq!(s.with_db(|_, db| Ok(db.index().len())).unwrap(), 1);
+        std::fs::write(d.path().join("b.txt"), "two\n").unwrap();
+        crate::index_project(d.path(), &FakeEmbedder, false).unwrap();
+        assert_eq!(s.with_db(|_, db| Ok(db.index().len())).unwrap(), 2);
+    }
+
+    #[test]
+    fn line_cap_rejects_only_overlong_lines() {
+        use tokio::io::AsyncReadExt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let read = |data: Vec<u8>| {
+            rt.block_on(async {
+                let mut out = Vec::new();
+                LineCap::new(&data[..], 8)
+                    .read_to_end(&mut out)
+                    .await
+                    .map(|_| out)
+            })
+        };
+        assert!(read(b"12345678\n12345678\n".to_vec()).is_ok());
+        assert!(read(b"123456789\n".to_vec()).is_err());
+    }
 }

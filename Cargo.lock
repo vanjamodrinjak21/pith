@@ -1095,6 +1095,7 @@ dependencies = [
  "ignore",
  "memmap2",
  "ort",
+ "pithdb",
  "proptest",
  "rmcp",
  "rustix",

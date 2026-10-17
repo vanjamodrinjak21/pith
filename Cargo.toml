@@ -22,7 +22,7 @@ sha2 = "0.11.1"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"], optional = true }
-tokio = { version = "1.53.3", default-features = false, features = ["rt"], optional = true }
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "io-std"], optional = true }
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 zstd = "0.14.3"
 
@@ -35,10 +35,14 @@ default = ["onnx", "mcp"]
 # ONNX Runtime (prebuilt, statically linked; fetched at build time) + HF tokenizers.
 onnx = ["dep:ort", "dep:tokenizers"]
 mcp = ["dep:rmcp", "dep:tokio", "dep:serde"]
+# Test-only switches (PITH_TEST_FAKE_EMBEDDER); never enable in release builds.
+test-hooks = []
 
 [dev-dependencies]
 proptest = "1.12.0"
 serde_json = "1.0.154"
+# Enables `test-hooks` for this crate's own tests and the binary they spawn.
+pithdb = { path = ".", default-features = false, features = ["test-hooks"] }
 
 [target."cfg(unix)".dependencies]
 rustix = { version = "1.1.5", features = ["fs", "process"] }

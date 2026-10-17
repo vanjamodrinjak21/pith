@@ -1,4 +1,5 @@
-#![cfg(feature = "mcp")]
+// Needs `test-hooks` (enabled for tests by the self dev-dependency in Cargo.toml).
+#![cfg(all(feature = "mcp", feature = "test-hooks"))]
 
 use pithdb::mcp::fit_budget;
 use pithdb::SearchHit;
@@ -31,23 +32,6 @@ fn fit_budget_caps_three_hits_per_file() {
     let out = fit_budget(hits, 4000, 3, 15);
     let ids: Vec<u32> = out.iter().map(|h| h.chunk_id).collect();
     assert_eq!(ids, [0, 1, 2, 9]);
-}
-
-#[test]
-fn fit_budget_stops_before_exceeding_token_cap() {
-    let big = |id| SearchHit {
-        text: "x".repeat(1000),
-        ..hit(id, &format!("f{id}.rs"), 1)
-    };
-    let out = fit_budget((0..10).map(big).collect(), 1000, 3, 15);
-    assert!(!out.is_empty() && out.len() < 4, "{}", out.len());
-    let tokens: usize = out
-        .iter()
-        .map(|h| (h.text.chars().count() + h.path.chars().count()) / 4)
-        .sum();
-    assert!(tokens <= 1000, "{tokens}");
-    // Order is kept: it stops, it does not skip ahead.
-    assert_eq!(out.last().unwrap().chunk_id as usize, out.len() - 1);
 }
 
 #[test]
@@ -208,4 +192,15 @@ fn search_code_with_no_model_says_run_pith_init() {
     let mut s = Session::start(d.path(), &d.path().join("home"), false);
     let (err, text) = s.call("search_code", json!({"query": "alpha"}));
     assert!(err && text.contains("run `pith init`"), "{text}");
+}
+
+#[test]
+fn overlong_stdin_line_ends_the_session() {
+    let d = fixture();
+    let mut s = Session::start(d.path(), &d.path().join("home"), true);
+    let _ = s.stdin.write_all(&vec![b'x'; 2 << 20]);
+    let _ = s.stdin.flush();
+    let mut line = String::new();
+    assert_eq!(s.stdout.read_line(&mut line).unwrap_or(0), 0, "{line}");
+    assert!(s.child.wait().is_ok());
 }

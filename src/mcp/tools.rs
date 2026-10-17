@@ -1,6 +1,7 @@
-use super::{budget::fit_budget, State};
+use super::budget::{clean_block, fit_budget, render_hit, tokens};
+use super::State;
 use crate::commands::{age, clean, unix_now, valid_head};
-use crate::{render_error, render_stats, search_project, stats_project, Error};
+use crate::{render_error, render_stats, search_project, stats_project, Error, SearchHit};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::schemars::JsonSchema;
@@ -85,63 +86,53 @@ impl Server {
     }
 }
 
-/// `clean` per line, keeping the newlines.
-fn clean_block(text: &str) -> String {
-    text.lines().map(clean).collect::<Vec<_>>().join("\n")
+/// First line of every search_code response: index age, plus the git head only when valid.
+pub(crate) fn staleness(git_head: Option<&str>, indexed_at: u64, now: u64) -> String {
+    let mut out = format!("indexed {}", age(now.saturating_sub(indexed_at)));
+    if let Some(h) = git_head.filter(|h| valid_head(h)) {
+        out.push_str(&format!(" at git {h}"));
+    }
+    out.push('\n');
+    out
+}
+
+pub(crate) fn render_response(header: &str, hits: &[SearchHit]) -> String {
+    let mut out = header.to_string();
+    out.extend(hits.iter().map(render_hit));
+    out
+}
+
+fn validate_query(query: &str) -> crate::Result<()> {
+    if query.trim().is_empty() {
+        return Err(Error::Invalid("query must not be empty".into()));
+    }
+    if query.chars().count() > MAX_QUERY_CHARS {
+        return Err(Error::Invalid(format!(
+            "query is longer than {MAX_QUERY_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn clamp_k(k: Option<u32>) -> usize {
+    k.unwrap_or(DEFAULT_K).clamp(1, MAX_K) as usize
 }
 
 impl Server {
     fn search(&self, query: &str, k: Option<u32>) -> crate::Result<String> {
-        if query.trim().is_empty() {
-            return Err(Error::Invalid("query must not be empty".into()));
-        }
-        if query.chars().count() > MAX_QUERY_CHARS {
-            return Err(Error::Invalid(format!(
-                "query is longer than {MAX_QUERY_CHARS} characters"
-            )));
-        }
-        let k = k.unwrap_or(DEFAULT_K).clamp(1, MAX_K) as usize;
+        validate_query(query)?;
+        let k = clamp_k(k);
         self.state.with_db(|root, db| {
             // Over-fetch so the per-file cap still leaves up to k results.
             let hits = self
                 .state
                 .with_embedder(|e| search_project(root, db, e, query, k * MAX_PER_FILE))?;
-            let mut hits = fit_budget(hits, MAX_TOKENS, MAX_PER_FILE, SNIPPET_LINES);
+            let meta = db.meta();
+            let header = staleness(meta.git_head.as_deref(), meta.indexed_at_unix, unix_now());
+            let budget = MAX_TOKENS.saturating_sub(tokens(header.chars().count()));
+            let mut hits = fit_budget(hits, budget, MAX_PER_FILE, SNIPPET_LINES);
             hits.truncate(k);
-            let mut out = format!(
-                "indexed {}",
-                age(unix_now().saturating_sub(db.meta().indexed_at_unix))
-            );
-            if let Some(h) = db.meta().git_head.as_deref().filter(|h| valid_head(h)) {
-                out.push_str(&format!(" at git {h}"));
-            }
-            out.push_str(&format!("; {} results\n", hits.len()));
-            for h in &hits {
-                let shown = h.text.lines().count() as u32;
-                let full = h.end_line.saturating_sub(h.start_line) + 1;
-                out.push_str(&format!(
-                    "\n{}:{}-{}  score {:.2}  chunk_id {}{}\n{}\n",
-                    clean(&h.path),
-                    h.start_line,
-                    h.end_line,
-                    h.score,
-                    h.chunk_id,
-                    if h.source_changed {
-                        "  [source changed since indexing]"
-                    } else {
-                        ""
-                    },
-                    clean_block(&h.text)
-                ));
-                if shown < full {
-                    out.push_str(&format!(
-                        "[{} more lines: get_chunk {}]\n",
-                        full - shown,
-                        h.chunk_id
-                    ));
-                }
-            }
-            Ok(out)
+            Ok(render_response(&header, &hits))
         })
     }
 }
@@ -158,13 +149,16 @@ impl ServerHandler for Server {
     }
 }
 
-pub(crate) async fn serve(state: Arc<State>) -> crate::Result<()> {
+pub(crate) async fn serve(state: Arc<State>, max_line: usize) -> crate::Result<()> {
     let server = Server {
         state,
         tool_router: Server::tool_router(),
     };
     let running = server
-        .serve(rmcp::transport::stdio())
+        .serve((
+            super::LineCap::new(tokio::io::stdin(), max_line),
+            tokio::io::stdout(),
+        ))
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
     running
@@ -172,4 +166,39 @@ pub(crate) async fn serve(state: Arc<State>) -> crate::Result<()> {
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn k_is_clamped_to_1_through_20() {
+        assert_eq!(clamp_k(Some(0)), 1);
+        assert_eq!(clamp_k(Some(1)), 1);
+        assert_eq!(clamp_k(Some(20)), 20);
+        assert_eq!(clamp_k(Some(21)), 20);
+        assert_eq!(clamp_k(None), DEFAULT_K as usize);
+    }
+
+    #[test]
+    fn query_length_limit_is_2000_chars() {
+        assert!(validate_query(&"é".repeat(2000)).is_ok());
+        assert!(validate_query(&"é".repeat(2001)).is_err());
+        assert!(validate_query(" \n").is_err());
+    }
+
+    #[test]
+    fn staleness_shows_only_a_valid_git_head() {
+        let good = "a".repeat(40);
+        assert!(staleness(Some(&good), 0, 5).contains(&good));
+        for bad in [
+            "\x1b[31m",
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+            "abc",
+        ] {
+            let s = staleness(Some(bad), 0, 5);
+            assert_eq!(s, "indexed 5 seconds ago\n", "{bad:?}");
+        }
+    }
 }
