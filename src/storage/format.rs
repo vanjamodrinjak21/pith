@@ -10,7 +10,7 @@
 //! 16   count            u32 number of chunks == number of vectors
 //! 20   reserved         u32 must be 0
 //! 24   chunks_len       u64 byte length of the compressed chunk section
-//! 32   table_raw_len    u64 decompressed length of the chunk table (<= MAX_TABLE_RAW)
+//! 32   table_raw_len    u64 decompressed length of the chunk table (<= table_raw_max(count))
 //! 40   hash_chunks      32  blake3 of the chunk section
 //! 72   hash_quant       32  blake3 of the int8 section
 //! 104  hash_f32         32  blake3 of the f32 section
@@ -64,7 +64,24 @@ const HASHES_AT: usize = 40;
 /// Smallest valid file: header plus the trailing file hash.
 pub const MIN_LEN: usize = HEADER_LEN + 32;
 /// Upper bound for the decompressed chunk table.
-pub const MAX_TABLE_RAW: u64 = 1 << 30;
+/// Per-chunk raw table budget: text of up to 1,400 chars (the chunker's limit) at
+/// up to 4 UTF-8 bytes each, plus 4,096 for the path and the 16 bytes of entry
+/// overhead: 1,400 * 4 + 4,096 = 9,696 bytes.
+pub const PER_CHUNK_MAX: u64 = 1_400 * 4 + 4_096;
+/// Model id, meta and git head share this.
+pub const TABLE_SLACK: u64 = 64 << 10;
+/// Last-resort ceiling regardless of count.
+pub const TABLE_RAW_CEILING: u64 = 8 << 30;
+/// Decompression grows in steps of this size, each reserved fallibly.
+const GROW_BLOCK: usize = 1 << 20;
+
+/// Largest raw chunk table a file with `count` chunks may declare.
+pub fn table_raw_max(count: u64) -> u64 {
+    count
+        .checked_mul(PER_CHUNK_MAX)
+        .and_then(|n| n.checked_add(TABLE_SLACK))
+        .map_or(TABLE_RAW_CEILING, |n| n.min(TABLE_RAW_CEILING))
+}
 const ALIGN: usize = 64;
 /// Up-front decompression reservation per compressed byte (text rarely exceeds it).
 const RESERVE_RATIO: u64 = 64;
@@ -156,9 +173,10 @@ pub fn encode(
         table.extend_from_slice(&c.end_line.to_le_bytes());
         put_str(&mut table, &c.text)?;
     }
-    if table.len() as u64 > MAX_TABLE_RAW {
+    let max = table_raw_max(count as u64);
+    if table.len() as u64 > max {
         return Err(Error::Invalid(format!(
-            "chunk table is {} bytes, over the {MAX_TABLE_RAW} byte limit",
+            "chunk table is {} bytes, over the {max} byte limit for {count} chunks",
             table.len()
         )));
     }
@@ -238,23 +256,45 @@ impl<'a> Reader<'a> {
 /// reserves at most `compressed_len * RESERVE_RATIO + 4 KiB` (fallibly), so a lying
 /// header cannot force a large allocation; the decoder refuses frames whose window
 /// exceeds what `raw_len` needs.
-fn decompress_bounded(src: &[u8], raw_len: u64) -> Result<Vec<u8>> {
-    if raw_len > MAX_TABLE_RAW {
-        return Err(corrupt(format!("chunk table length {raw_len} over limit")));
+fn decompress_bounded(src: &[u8], raw_len: u64, count: u64) -> Result<Vec<u8>> {
+    let max = table_raw_max(count);
+    if raw_len > max {
+        return Err(corrupt(format!(
+            "chunk table length {raw_len} over limit {max} for {count} chunks"
+        )));
     }
     let err = |e: std::io::Error| corrupt(format!("chunk section: {e}"));
     // Reserve in proportion to the input, not the header's claim, and fallibly;
     // the buffer grows past that only as bytes are really produced (<= raw_len + 1,
     // the +1 detecting overlong output).
     let reserve = (raw_len + 1).min(src.len() as u64 * RESERVE_RATIO + 4096);
+    let no_mem = |n: u64| corrupt(format!("cannot reserve {n} bytes for chunk table"));
     let mut out = Vec::new();
     out.try_reserve_exact(reserve as usize)
-        .map_err(|_| corrupt(format!("cannot reserve {reserve} bytes for chunk table")))?;
+        .map_err(|_| no_mem(reserve))?;
     // A frame needs no window larger than its content; refuse frames declaring more.
     let window_log = (64 - raw_len.leading_zeros()).clamp(10, 31);
     let mut dec = zstd::stream::read::Decoder::new(src).map_err(err)?;
     dec.window_log_max(window_log).map_err(err)?;
-    dec.take(raw_len + 1).read_to_end(&mut out).map_err(err)?;
+    let limit = raw_len + 1;
+    let mut dec = dec.take(limit);
+    loop {
+        let len = out.len();
+        let want = GROW_BLOCK.min((limit - len as u64) as usize);
+        if want == 0 {
+            break;
+        }
+        if out.capacity() - len < want {
+            out.try_reserve(want)
+                .map_err(|_| no_mem((len + want) as u64))?;
+        }
+        out.resize(len + want, 0); // within capacity: cannot allocate
+        let n = dec.read(&mut out[len..]).map_err(err)?;
+        out.truncate(len + n);
+        if n == 0 {
+            break;
+        }
+    }
     if out.len() as u64 != raw_len {
         return Err(corrupt(format!(
             "chunk table decompressed to {}{} bytes, header says {raw_len}",
@@ -323,7 +363,7 @@ pub fn decode(map: Arc<memmap2::Mmap>) -> Result<Decoded> {
         return Err(corrupt("dimension is 0"));
     }
 
-    let table = decompress_bounded(&b[ranges[0].clone()], raw_len)?;
+    let table = decompress_bounded(&b[ranges[0].clone()], raw_len, count as u64)?;
     let mut r = Reader(&table);
     let model_id = r.str()?;
     let indexed_at_unix = r.u64()?;

@@ -107,9 +107,12 @@ fn table(flag: u8, entries: u32, tail: &[u8]) -> Vec<u8> {
     t
 }
 
-/// A version-1 file with no vector data, built independently of the writer, so
-/// fields the writer never produces can be set while every checksum is valid.
+/// A version-1 file with all-zero vectors (valid: quantize(0) == 0), built
+/// independently of the writer, so fields the writer never produces can be set
+/// while every checksum is valid.
 fn assemble(dim: u32, count: u32, packed: &[u8], raw_len: u64) -> Vec<u8> {
+    let n = dim as usize * count as usize;
+    let (q, f) = (vec![0u8; n], vec![0u8; 4 * n]);
     let mut b = Vec::new();
     b.extend_from_slice(b"PITHDB\0\0");
     for v in [1, dim, count, 0] {
@@ -117,13 +120,16 @@ fn assemble(dim: u32, count: u32, packed: &[u8], raw_len: u64) -> Vec<u8> {
     }
     b.extend_from_slice(&(packed.len() as u64).to_le_bytes());
     b.extend_from_slice(&raw_len.to_le_bytes());
-    for s in [packed, &[], &[]] {
+    for s in [packed, &q, &f] {
         b.extend_from_slice(blake3::hash(s).as_bytes());
     }
     b.extend_from_slice(&[0; 32]);
     reseal_header(&mut b);
     b.extend_from_slice(packed);
     b.resize(align64(b.len()), 0);
+    b.extend_from_slice(&q);
+    b.resize(align64(b.len()), 0);
+    b.extend_from_slice(&f);
     b.extend_from_slice(&[0; 32]);
     reseal_file(&mut b);
     b
@@ -348,13 +354,46 @@ fn reserved_field_must_be_zero() {
 #[test]
 fn crafted_valid_file_opens() {
     // Proves `assemble` matches the format, so the crafted rejections below are real.
-    let db = open_bytes(&assemble_table(4, 2, &table(0, 2, &[]))).err();
-    // count 2 with no vector data cannot be valid: dim 4 needs 8 values.
-    assert!(db.is_some());
+    let db = open_bytes(&assemble_table(4, 2, &table(0, 2, &[]))).unwrap();
+    assert_eq!(db.chunk(1).unwrap().text, "text");
+    assert_eq!(db.index().len(), 2);
     let db = open_bytes(&assemble_table(4, 0, &table(0, 0, &[]))).unwrap();
     assert_eq!(db.model_id(), "m");
     assert_eq!(db.meta().indexed_at_unix, 7);
     assert_eq!(db.index().dim(), 4);
+}
+
+#[test]
+fn huge_count_without_matching_data_rejected_by_layout() {
+    // A huge count raises the table bound, but the file must then hold the vectors.
+    let raw = table(0, 0, &[]);
+    let packed = zstd::bulk::compress(&raw, 3).unwrap();
+    let mut b = assemble(1, 0, &packed, 1 << 33);
+    b[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    reseal(&mut b);
+    assert!(corrupt_msg(&b).contains("section lengths"));
+}
+
+#[test]
+fn million_tiny_chunks_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".pith");
+    let n = 1_000_000;
+    let chunks: Vec<StoredChunk> = (0..n)
+        .map(|i| StoredChunk {
+            path: String::new(),
+            start_line: i,
+            end_line: i,
+            text: String::new(),
+        })
+        .collect();
+    let full: Vec<f32> = (0..n).map(|i| (i % 7) as f32 / 7.0).collect();
+    let index = VectorIndex::build(full.chunks(1).map(<[f32]>::to_vec).collect()).unwrap();
+    Db::write(&path, "m", chunks, &index, meta()).unwrap();
+    let db = Db::open(&path, Some(("m", 1))).unwrap();
+    assert_eq!(db.index().len(), n as usize);
+    assert_eq!(db.chunk(n - 1).unwrap().start_line, n - 1);
+    assert_eq!(db.chunk(n), None);
 }
 
 #[test]
@@ -392,10 +431,18 @@ fn decompression_is_bounded_by_stated_raw_length() {
     // Small payload claiming a huge raw length: refused before decompressing.
     let m = corrupt_msg(&assemble(4, 0, &packed, 1 << 40));
     assert!(m.contains("over limit"), "{m}");
-    // Claims the full 1 GiB maximum with a tiny payload: rejected cleanly, having
-    // reserved only ~packed.len() * 64 + 4 KiB.
-    let m = corrupt_msg(&assemble(4, 0, &packed, 1 << 30));
-    assert!(m.contains(&format!("{} bytes, header says {}", raw.len(), 1u64 << 30)), "{m}");
+    // Over the count-derived bound by one byte (count 0 and count 1).
+    let m = corrupt_msg(&assemble(4, 0, &packed, 64 * 1024 + 1));
+    assert!(m.contains("over limit 65536 for 0 chunks"), "{m}");
+    let m = corrupt_msg(&assemble(1, 1, &packed, 9_696 + 65_536 + 1));
+    assert!(m.contains("over limit 75232 for 1 chunks"), "{m}");
+    // 1 GiB claimed by a header whose count (200k, dim 1) allows it, with a tiny
+    // payload: rejected cleanly, having reserved only ~packed.len() * 64 + 4 KiB.
+    let m = corrupt_msg(&assemble(1, 200_000, &packed, 1 << 30));
+    assert!(
+        m.contains(&format!("{} bytes, header says {}", raw.len(), 1u64 << 30)),
+        "{m}"
+    );
     // Claims more than it holds.
     let m = corrupt_msg(&assemble(4, 0, &packed, raw.len() as u64 + 100));
     assert!(m.contains("header says"), "{m}");
