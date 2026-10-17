@@ -93,6 +93,8 @@ impl OnnxEmbedder {
     /// release build on an M4 Pro, measured), so a corrupted or swapped file is never loaded.
     /// Symlinked model directories and files are refused. Offline.
     pub fn load_with(models_dir: &Path, cfg: OnnxConfig) -> Result<Self> {
+        // `models_dir` itself may be a symlink (users relocate ~/.pith or PITH_HOME; it is their
+        // own path). The `<id>` dir and the files below it, which pull manages, may not be.
         let dir = models_dir.join(DEFAULT_MODEL.id);
         match std::fs::symlink_metadata(&dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

@@ -29,17 +29,19 @@ pub fn pull(models_dir: &Path, base_url: &str) -> Result<()> {
 /// is not; every file on disk is always a complete verified one). On any failure before the
 /// renames the temp files are removed and the existing files are untouched. Files already present
 /// with the right hash are not downloaded. Concurrent pulls into one dir serialize on a lock file.
-/// Plain `http` is accepted only to loopback and only when `base_url` itself is loopback (tests);
-/// redirects may never downgrade from https to http, and from a non-loopback origin they may not
-/// point at loopback, private, link-local or unspecified IP literals. (Hostnames that resolve to
-/// private addresses are not caught; the pinned origin is Hugging Face over TLS.)
+/// URL policy (see [`check_url`]): a loopback base URL (tests) may use http and its redirects must
+/// stay on loopback. Any other base URL and every redirect from it must be https to a DNS name
+/// whose last label is letters only, which rules out every IP-literal form (dotted, decimal, hex,
+/// short, IPv6, IPv4-mapped) and `localhost`/`.localhost`/`.local`/`.internal`/`.localdomain`.
+/// Not covered: a public DNS name that resolves to a private address (no DNS lookups here, to
+/// avoid rebinding races); TLS certificate validation is the backstop.
 pub fn pull_files(dir: &Path, base_url: &str, files: &[ModelFile<'_>]) -> Result<()> {
     for f in files {
         check_local_name(f.local)?;
     }
     let origin_local = check_url(base_url, false, true)?;
     create_private_dir(dir)?;
-    let _lock = acquire_lock(&dir.join(LOCK_NAME))?;
+    let _lock = acquire_lock(&dir.join(LOCK_NAME), LOCK_TIMEOUT)?;
     // Under the lock no other pull is live, so every temp file left here is from a crash.
     for e in fs::read_dir(dir)?.flatten() {
         if e.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
@@ -242,10 +244,10 @@ fn split(url: &str) -> Option<(&str, &str)> {
     Some((scheme, rest.split(['/', '?', '#']).next().unwrap_or("")))
 }
 
-/// Checks a URL and returns whether its host is loopback. https is always allowed except that,
-/// unless `local_ok` (the caller's own base URL was loopback), the host may not be a loopback,
-/// private, link-local or unspecified IP literal. http is allowed only to loopback and only when
-/// `local_ok`. Userinfo is never allowed.
+/// Checks a URL; returns whether its host is loopback. With `local_ok` (base URL check, or a
+/// redirect from a loopback base) a loopback host (`localhost`, 127.0.0.0/8 dotted quad, `::1`)
+/// is accepted over http or https. Otherwise the URL must be https to a plain DNS name (see
+/// [`is_public_dns_name`]); a redirect from a loopback base may not leave loopback.
 fn check_url(url: &str, redirect: bool, local_ok: bool) -> Result<bool> {
     let what = if redirect {
         "refusing redirect to"
@@ -257,62 +259,88 @@ fn check_url(url: &str, redirect: bool, local_ok: bool) -> Result<bool> {
     if authority.contains('@') {
         return Err(bad("credentials in URLs are not supported"));
     }
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "https" && scheme != "http" {
+        return Err(bad("only https is allowed"));
+    }
     let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => authority.split(':').next().unwrap_or(""),
-    };
-    if host.is_empty() {
-        return Err(bad("no host"));
+        Some(v6) => format!("[{}]", v6.split(']').next().unwrap_or("")),
+        None => authority.split(':').next().unwrap_or("").to_string(),
     }
-    let loopback = is_loopback(host);
-    if !local_ok && (loopback || is_private(host)) {
-        return Err(bad("local or private addresses are not allowed"));
+    .to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    if local_ok && is_loopback(host) {
+        return Ok(true);
     }
-    match scheme {
-        "https" => Ok(loopback),
-        "http" if local_ok && loopback => Ok(true),
-        "http" => Err(bad(
+    if redirect && local_ok {
+        return Err(bad(
+            "redirects from a loopback base URL must stay on loopback",
+        ));
+    }
+    if scheme != "https" {
+        return Err(bad(
             "plain http is only allowed to loopback, from a loopback base URL",
-        )),
-        _ => Err(bad("only https is allowed")),
+        ));
     }
+    if !is_public_dns_name(host) {
+        return Err(bad(
+            "host must be a public DNS name (no IP literals or local names)",
+        ));
+    }
+    Ok(false)
 }
 
 fn is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    let inner = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+    host == "localhost"
+        || inner
+            .unwrap_or(host)
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
-fn is_private(host: &str) -> bool {
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => ip.is_private() || ip.is_link_local() || ip.is_unspecified(),
-        Ok(IpAddr::V6(ip)) => {
-            let s0 = ip.segments()[0];
-            ip.is_unspecified() || s0 & 0xfe00 == 0xfc00 || s0 & 0xffc0 == 0xfe80
-        }
-        Err(_) => false,
-    }
+/// Lowercased host (one trailing dot stripped): LDH labels, last label letters only, and not a
+/// local-only name. Shape-based on purpose: no IP literal of any spelling can pass.
+fn is_public_dns_name(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let ldh = labels.iter().all(|l| {
+        !l.is_empty()
+            && l.len() <= 63
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    });
+    let last = labels.last().copied().unwrap_or("");
+    let local = ["localhost", "local", "internal", "localdomain"].contains(&last);
+    ldh && labels.len() >= 2 && last.bytes().all(|b| b.is_ascii_lowercase()) && !local
 }
 
-/// Opens (mode 0600) and exclusively locks the pull lock file, waiting up to `LOCK_TIMEOUT`.
-fn acquire_lock(path: &Path) -> Result<fs::File> {
+/// Opens and exclusively locks the pull lock file, waiting up to `timeout`. A new lock file gets
+/// mode 0600 (the mode applies only on creation; an existing file keeps its mode). A symlink at
+/// the lock path is refused (O_NOFOLLOW).
+fn acquire_lock(path: &Path, timeout: Duration) -> Result<fs::File> {
     let mut o = fs::OpenOptions::new();
     o.create(true).truncate(false).write(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    let file = o.open(path)?;
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    let file = o
+        .open(path)
+        .map_err(|e| dl(format!("cannot open lock file {} ({e})", path.display())))?;
     let start = Instant::now();
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file), // released on drop
-            Err(fs::TryLockError::WouldBlock) if start.elapsed() < LOCK_TIMEOUT => {
+            Err(fs::TryLockError::WouldBlock) if start.elapsed() < timeout => {
                 std::thread::sleep(Duration::from_millis(100))
             }
             Err(fs::TryLockError::WouldBlock) => {
                 return Err(dl(format!(
-                    "another `pith model pull` holds {} (waited {} s); retry when it finishes",
+                    "another `pith model pull` holds {} (waited {:.1} s); retry when it finishes",
                     path.display(),
-                    LOCK_TIMEOUT.as_secs()
+                    timeout.as_secs_f32()
                 )))
             }
             Err(fs::TryLockError::Error(e)) => {
@@ -350,35 +378,93 @@ mod tests {
 
     #[test]
     fn redirect_policy() {
-        // production: https origin (not local)
+        // production: https origin; check_url(.., true, origin_local) is exactly what download()
+        // runs on every hop
         let local = check_url("https://huggingface.co/x", false, true).unwrap();
         assert!(!local);
+        assert!(!check_url("HTTPS://HUGGINGFACE.CO/x", false, true).unwrap());
         for to in [
+            "http://cdn.example.com/m",
             "http://127.0.0.1/m",
-            "http://localhost:8080/m",
-            "http://[::1]/m",
-            "http://cdn.example/m",
             "https://127.0.0.1/m",
+            "https://2130706433/m",
+            "https://0x7f000001/m",
+            "https://127.1/m",
+            "https://0/m",
+            "https://0.0.0.0/m",
+            "https://100.64.0.1/m",
             "https://localhost/m",
+            "https://localhost./m",
+            "https://LOCALHOST/m",
+            "https://foo.localhost/m",
+            "https://printer.local/m",
+            "https://metadata.google.internal/m",
+            "https://box.localdomain/m",
             "https://[::1]/m",
-            "https://10.0.0.5/m",
+            "https://[::ffff:127.0.0.1]/m",
+            "https://[::ffff:10.0.0.1]/m",
+            "https://10.0.0.1/m",
             "https://192.168.1.1/m",
             "https://172.16.0.1/m",
             "https://169.254.169.254/latest",
-            "https://0.0.0.0/m",
             "https://[fd00::1]/m",
-            "https://[fe80::1]/m",
+            "https://8.8.8.8/m",
+            "https://single/m",
         ] {
             let err = check_url(to, true, local).unwrap_err();
             assert!(err.to_string().contains("refusing redirect"), "{to}: {err}");
         }
-        assert!(check_url("https://cdn.example/m", true, local).is_ok());
-        assert!(check_url("https://8.8.8.8/m", true, local).is_ok());
-        // loopback-http base (tests) may redirect within loopback, never to non-loopback http
+        for ok in [
+            "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc?sig=1",
+            "https://us.aws.cdn.hf.co/x",
+            "https://cdn-lfs.huggingface.co./x",
+            "HTTPS://CDN.EXAMPLE.COM/m",
+        ] {
+            assert!(check_url(ok, true, local).is_ok(), "{ok}");
+        }
+        // loopback base (tests): may use http, redirects must stay on loopback
         assert!(check_url("http://127.0.0.1:9/m", false, true).unwrap());
         assert!(check_url("http://127.0.0.1:9/m", true, true).is_ok());
+        assert!(check_url("http://[::1]:9/m", true, true).is_ok());
         assert!(check_url("http://example.com/m", true, true).is_err());
+        assert!(check_url("https://example.com/m", true, true).is_err());
         assert!(check_url("http://192.168.1.1/m", true, true).is_err());
+        // plain http base off loopback is refused outright
+        assert!(check_url("http://example.com/m", false, true).is_err());
+    }
+
+    #[test]
+    fn lock_times_out_with_a_clear_error() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(LOCK_NAME);
+        let _held = acquire_lock(&p, Duration::ZERO).unwrap();
+        let t = Instant::now();
+        let err = acquire_lock(&p, Duration::from_millis(300)).unwrap_err();
+        assert!(t.elapsed() >= Duration::from_millis(300));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".pull.lock") && msg.contains("another"),
+            "{msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_keeps_existing_mode_and_refuses_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(LOCK_NAME);
+        fs::write(&p, b"").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(acquire_lock(&p, Duration::ZERO).unwrap());
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let link = d.path().join("link.lock");
+        std::os::unix::fs::symlink(&p, &link).unwrap();
+        let err = acquire_lock(&link, Duration::ZERO).unwrap_err();
+        assert!(err.to_string().contains("cannot open lock file"), "{err}");
     }
 
     #[test]
@@ -399,6 +485,7 @@ mod tests {
         let j = join(b, "//cdn.hf.co/p").unwrap();
         assert!(check_url(&j, true, false).is_ok());
         assert!(check_url(&join(b, "//127.0.0.1/p").unwrap(), true, false).is_err());
+        assert!(check_url(&join(b, "/p").unwrap(), true, false).is_ok());
     }
 
     #[test]

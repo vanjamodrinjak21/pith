@@ -268,17 +268,21 @@ fn pull_rejects_plain_http_to_non_loopback_and_https_downgrade() {
     }
     // End to end through download(): redirects off loopback over plain http are refused before
     // any connection is made to the target.
-    for (to, route) in [
-        ("http://example.com/m.onnx", "/a/onnx/m.onnx"),
-        ("http://192.168.1.1/m.onnx", "/b/onnx/m.onnx"),
-        ("ftp://127.0.0.1/m.onnx", "/c/onnx/m.onnx"),
+    // A refused redirect makes no request to its target: point it at a second logged server.
+    let (target, target_log) = serve_logged(vec![]);
+    let target_port = target.rsplit(':').next().unwrap();
+    for to in [
+        "http://example.com/m.onnx".to_string(),
+        "http://192.168.1.1/m.onnx".to_string(),
+        "https://example.com/m.onnx".to_string(),
+        format!("ftp://127.0.0.1:{target_port}/m.onnx"),
     ] {
-        let base = serve(vec![(route, Reply::Redirect(to.into()))]);
-        let prefix = &route[..2];
-        let err = pull_files(d.path(), &format!("{base}{prefix}"), &f.files()).unwrap_err();
+        let base = serve(vec![("/onnx/m.onnx", Reply::Redirect(to.clone()))]);
+        let err = pull_files(d.path(), &base, &f.files()).unwrap_err();
         assert!(err.to_string().contains("refusing redirect"), "{to}: {err}");
         assert!(names(d.path()).is_empty());
     }
+    assert!(target_log.lock().unwrap().is_empty());
 }
 
 #[test]
