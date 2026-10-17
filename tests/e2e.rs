@@ -92,7 +92,7 @@ fn reindex_required_when_model_id_differs() {
     let d = project();
     index_project(d.path(), &FakeEmbedder, false).unwrap();
     let e = index_project(d.path(), &Other(FakeEmbedder), false).unwrap_err();
-    assert!(matches!(e, Error::ModelMismatch { .. }));
+    assert!(matches!(e, Error::ModelMismatch { .. }), "{e:?}");
     assert!(e.to_string().contains("pith index --reindex"));
     index_project(d.path(), &Other(FakeEmbedder), true).unwrap();
     assert_eq!(open(d.path()).1.model_id(), "other-384");
