@@ -1,5 +1,6 @@
 /// Crate-wide error type; later tasks add variants.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),

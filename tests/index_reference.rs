@@ -233,3 +233,10 @@ fn bad_query_errors_even_when_k_zero_or_index_empty() {
     let blank = VectorIndex::build(vec![]).unwrap();
     assert!(blank.try_search(&[1.0, 2.0], 3).unwrap().is_empty());
 }
+
+#[test]
+fn from_parts_dim_zero_is_dimensionless_empty() {
+    let idx = VectorIndex::from_parts(0, vec![], vec![]).unwrap();
+    assert!(idx.is_empty());
+    assert!(idx.try_search(&[1.0], 3).unwrap().is_empty());
+}
