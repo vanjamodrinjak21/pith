@@ -5,13 +5,26 @@
 //! dot-directories are walked on purpose so the secrets deny list, not the walker's
 //! hidden-file filter, decides what is excluded; `.git` itself is never entered.
 //!
-//! Limits, stated plainly. The PEM content check is header-only: raw base64 or DER keys
-//! without a header are not detected by content (DER is binary and skipped as such).
-//! Unicode-confusable file names are not normalized; they are different names from the
-//! real secret names, so they are not a bypass. On non-unix targets (best effort) files
-//! are opened without `O_NOFOLLOW`, without a file-identity check and without the
-//! resolved-path check; only the walk-time symlink skip applies, so the race guarantee
-//! documented on [`collect`] is weaker there.
+//! Limits, stated plainly.
+//!
+//! - The PEM content check is header-only: raw base64 or DER keys without a header are
+//!   not detected by content (DER is binary and skipped as such).
+//! - Deny rules are path-based, so an in-tree hardlink to a secret under another name is
+//!   not detected by name; the PEM content check is the backstop for key material.
+//! - `.ssh`, `.gnupg`, `.aws` and `.kube` directory names are denied wholesale everywhere
+//!   in the tree, so a legitimate source directory with one of those names is not indexed.
+//! - After each open the file's real path is resolved from the handle (`F_GETPATH` on
+//!   macOS, `/proc/self/fd` elsewhere). On unix systems with neither (the BSDs by default,
+//!   such as FreeBSD, OpenBSD and NetBSD, and some minimal containers without `/proc`)
+//!   every file is skipped as `Unreadable` and indexing produces nothing. Failing closed
+//!   is deliberate.
+//! - Names are not Unicode-normalized beyond lowercasing. Characters that lowercase to
+//!   ASCII, such as KELVIN SIGN (U+212A, which becomes `k`), are folded and so fail
+//!   closed; homoglyphs from other scripts are different file names from the real secret
+//!   names and are not normalized.
+//! - On non-unix targets (best effort) files are opened without `O_NOFOLLOW`, without a
+//!   file-identity check and without the resolved-path check; only the walk-time symlink
+//!   skip applies, so the race guarantee documented on [`collect`] is weaker there.
 
 mod chunk;
 mod deny;

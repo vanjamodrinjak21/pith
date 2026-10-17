@@ -34,6 +34,9 @@ const SNIFF_BYTES: u64 = 8 * 1024;
 /// check and no resolved-path check; only the walk-time symlink skip applies, so the
 /// race guarantee is weaker there.
 ///
+/// Limitation: deny rules are path-based, so an in-tree hardlink to a secret under another
+/// name is not detected by name; the PEM content check is the backstop for key material.
+///
 /// Memory: all chunks of the project are held in the returned report, which is
 /// acceptable for this slice (files are capped at [`MAX_FILE_BYTES`]).
 pub fn collect(root: &Path) -> Result<CollectReport> {
@@ -230,7 +233,8 @@ fn verify_resolved(resolved: &Path, canonical_root: &Path) -> std::result::Resul
             "resolved path escapes the root".into(),
         ));
     };
-    if deny::is_denied(rel) {
+    // Mirror the walker, which never enters `.git`.
+    if deny::is_denied(rel) || rel.components().any(|c| c.as_os_str() == ".git") {
         return Err(SkipReason::Denied);
     }
     Ok(())
@@ -382,6 +386,32 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let (f, walked) = swap_dir_for_link(&root, "sub", &root.join("other"));
         assert_eq!(read_text(&f, &walked, &root).unwrap(), "walked\n");
+    }
+
+    #[test]
+    fn directory_swapped_for_dot_git_is_not_read() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let (f, walked) = swap_dir_for_link(&root, "sub", &root.join(".git"));
+        assert_eq!(read_text(&f, &walked, &root), Err(SkipReason::Denied));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_given_in_other_case_still_indexes() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("Proj")).unwrap();
+        std::fs::write(base.join("Proj/a.txt"), "hi\n").unwrap();
+        if !base.join("proj/a.txt").exists() {
+            eprintln!(
+                "SKIPPED (case-sensitive filesystem): root_given_in_other_case_still_indexes"
+            );
+            return;
+        }
+        let r = crate::ingest::collect(&base.join("proj")).unwrap();
+        assert_eq!(r.chunks.len(), 1, "{:?}", r.skipped);
     }
 
     #[test]

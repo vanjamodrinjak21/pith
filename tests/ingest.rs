@@ -115,6 +115,7 @@ fn unreadable_file_is_skipped_not_fatal() {
     use std::os::unix::fs::PermissionsExt;
     let d = tempfile::tempdir().unwrap();
     if is_root() {
+        // libtest captures this for passing tests; run with --nocapture to see it.
         eprintln!("SKIPPED (running as root): unreadable_file_is_skipped_not_fatal");
         return;
     }
@@ -480,6 +481,7 @@ fn fifo_is_not_opened_and_is_recorded() {
 fn unreadable_directory_is_reported_with_its_path() {
     use std::os::unix::fs::PermissionsExt;
     if is_root() {
+        // libtest captures this for passing tests; run with --nocapture to see it.
         eprintln!("SKIPPED (running as root): unreadable_directory_is_reported_with_its_path");
         return;
     }
@@ -497,4 +499,23 @@ fn unreadable_directory_is_reported_with_its_path() {
         "{:?}",
         r.skipped
     );
+}
+
+#[test]
+fn hardlinked_pem_under_another_name_is_caught_by_content() {
+    let d = tempfile::tempdir().unwrap();
+    let hdr = format!("-----BEGIN {} PRIVATE KEY-----", "RSA");
+    write(d.path(), "server.pem", format!("{hdr}\nMIIE\n"));
+    fs::hard_link(d.path().join("server.pem"), d.path().join("notes.txt")).unwrap();
+    let r = collect(d.path()).unwrap();
+    assert!(r.chunks.is_empty(), "{:?}", r.chunks);
+    assert!(
+        r.skipped
+            .contains(&("notes.txt".into(), SkipReason::Secret)),
+        "{:?}",
+        r.skipped
+    );
+    assert!(r
+        .skipped
+        .contains(&("server.pem".into(), SkipReason::Denied)));
 }

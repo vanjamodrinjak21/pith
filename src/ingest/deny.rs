@@ -299,6 +299,15 @@ mod tests {
     }
 
     #[test]
+    fn aws_and_kube_dirs_deny_even_ordinary_source_names() {
+        for n in SOURCE_NAMES {
+            for d in [".aws", ".kube"] {
+                assert!(is_denied(&Path::new(d).join(n)), "{d}/{n}");
+            }
+        }
+    }
+
+    #[test]
     fn known_source_names_stay_allowed() {
         for n in SOURCE_NAMES {
             assert!(!is_denied(Path::new(n)), "{n}");
