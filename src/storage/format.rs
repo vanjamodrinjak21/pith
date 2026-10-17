@@ -339,13 +339,7 @@ pub fn decode(map: Arc<memmap2::Mmap>) -> Result<Decoded> {
     let [_, q, f] = ranges;
     let index =
         VectorIndex::from_mapped(dim, map, q, f).map_err(|e| corrupt(format!("vectors: {e}")))?;
-    if index.len() != chunks.len() {
-        return Err(corrupt(format!(
-            "{} chunks but {} vectors",
-            chunks.len(),
-            index.len()
-        )));
-    }
+    check_counts(chunks.len(), &index)?;
     Ok(Decoded {
         model_id,
         meta: IndexMeta {
@@ -355,4 +349,34 @@ pub fn decode(map: Arc<memmap2::Mmap>) -> Result<Decoded> {
         chunks,
         index,
     })
+}
+
+/// Defensive: unreachable from file bytes today, because with `dim > 0` the header
+/// `count` fixes both the chunk count and the vector count. Kept so a future
+/// layout change cannot silently pair chunks with the wrong vectors.
+fn check_counts(chunks: usize, index: &VectorIndex) -> Result<()> {
+    if index.len() != chunks {
+        return Err(corrupt(format!(
+            "{chunks} chunks but {} vectors",
+            index.len()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_counts_rejects_mismatch() {
+        let index = VectorIndex::build(vec![vec![0.6, 0.8]; 3]).unwrap();
+        assert!(check_counts(3, &index).is_ok());
+        for n in [0, 2, 4] {
+            match check_counts(n, &index) {
+                Err(Error::CorruptDb(m)) => assert_eq!(m, format!("{n} chunks but 3 vectors")),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
 }
