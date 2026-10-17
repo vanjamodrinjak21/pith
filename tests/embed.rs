@@ -268,20 +268,26 @@ fn pull_rejects_plain_http_to_non_loopback_and_https_downgrade() {
     }
     // End to end through download(): redirects off loopback over plain http are refused before
     // any connection is made to the target.
-    // A refused redirect makes no request to its target: point it at a second logged server.
-    let (target, target_log) = serve_logged(vec![]);
-    let target_port = target.rsplit(':').next().unwrap();
     for to in [
-        "http://example.com/m.onnx".to_string(),
-        "http://192.168.1.1/m.onnx".to_string(),
-        "https://example.com/m.onnx".to_string(),
-        format!("ftp://127.0.0.1:{target_port}/m.onnx"),
+        "http://example.com/m.onnx",
+        "http://192.168.1.1/m.onnx",
+        "https://example.com/m.onnx",
     ] {
-        let base = serve(vec![("/onnx/m.onnx", Reply::Redirect(to.clone()))]);
+        let base = serve(vec![("/onnx/m.onnx", Reply::Redirect(to.into()))]);
         let err = pull_files(d.path(), &base, &f.files()).unwrap_err();
         assert!(err.to_string().contains("refusing redirect"), "{to}: {err}");
         assert!(names(d.path()).is_empty());
     }
+    // A refused redirect makes no request to its target. `127.1` is the short form of 127.0.0.1:
+    // the system resolver connects to it, but check_url refuses it, so the logged server on that
+    // port must see nothing. (Verified discriminating by disabling the check: the test fails.)
+    let (target, target_log) = serve_logged(vec![("/m.onnx", Reply::Body(f.a.clone(), None))]);
+    let target_port = target.rsplit(':').next().unwrap();
+    let to = format!("http://127.1:{target_port}/m.onnx");
+    let base = serve(vec![("/onnx/m.onnx", Reply::Redirect(to.clone()))]);
+    let err = pull_files(d.path(), &base, &f.files()).unwrap_err();
+    assert!(err.to_string().contains("refusing redirect"), "{to}: {err}");
+    assert!(names(d.path()).is_empty());
     assert!(target_log.lock().unwrap().is_empty());
 }
 

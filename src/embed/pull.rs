@@ -32,9 +32,13 @@ pub fn pull(models_dir: &Path, base_url: &str) -> Result<()> {
 /// URL policy (see [`check_url`]): a loopback base URL (tests) may use http and its redirects must
 /// stay on loopback. Any other base URL and every redirect from it must be https to a DNS name
 /// whose last label is letters only, which rules out every IP-literal form (dotted, decimal, hex,
-/// short, IPv6, IPv4-mapped) and `localhost`/`.localhost`/`.local`/`.internal`/`.localdomain`.
-/// Not covered: a public DNS name that resolves to a private address (no DNS lookups here, to
-/// avoid rebinding races); TLS certificate validation is the backstop.
+/// short, IPv6, IPv4-mapped) and names under local-only or reserved TLDs (`localhost`, `local`,
+/// `internal`, `localdomain`, `lan`, `home`, `corp`, `test`, `example`, `invalid`, `arpa`,
+/// `intranet`, `private`, `onion`).
+/// Not covered: public DNS names that resolve to private or loopback addresses (nip.io-style
+/// names, or rebinding); there are no DNS lookups here. Such a server would also need a TLS
+/// certificate valid for that name, and anything it serves still fails the size and sha256
+/// checks, so the residual risk is a GET request reaching a local service, not a bad model.
 pub fn pull_files(dir: &Path, base_url: &str, files: &[ModelFile<'_>]) -> Result<()> {
     for f in files {
         check_local_name(f.local)?;
@@ -310,7 +314,23 @@ fn is_public_dns_name(host: &str) -> bool {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     });
     let last = labels.last().copied().unwrap_or("");
-    let local = ["localhost", "local", "internal", "localdomain"].contains(&last);
+    let local = [
+        "localhost",
+        "local",
+        "internal",
+        "localdomain",
+        "lan",
+        "home",
+        "corp",
+        "test",
+        "example",
+        "invalid",
+        "arpa",
+        "intranet",
+        "private",
+        "onion",
+    ]
+    .contains(&last);
     ldh && labels.len() >= 2 && last.bytes().all(|b| b.is_ascii_lowercase()) && !local
 }
 
@@ -326,9 +346,12 @@ fn acquire_lock(path: &Path, timeout: Duration) -> Result<fs::File> {
         o.mode(0o600)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
     }
-    let file = o
-        .open(path)
-        .map_err(|e| dl(format!("cannot open lock file {} ({e})", path.display())))?;
+    let file = o.open(path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot open lock file {}: {e}", path.display()),
+        )
+    })?;
     let start = Instant::now();
     loop {
         match file.try_lock() {
@@ -410,6 +433,12 @@ mod tests {
             "https://[fd00::1]/m",
             "https://8.8.8.8/m",
             "https://single/m",
+            "https://x.lan/m",
+            "https://x.home.arpa/m",
+            "https://1.0.0.127.in-addr.arpa/m",
+            "https://x.test/m",
+            "https://x.corp/m",
+            "https://x.onion/m",
         ] {
             let err = check_url(to, true, local).unwrap_err();
             assert!(err.to_string().contains("refusing redirect"), "{to}: {err}");

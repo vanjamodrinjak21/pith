@@ -91,7 +91,8 @@ impl OnnxEmbedder {
     /// Vectors depend slightly on `cfg.batch_size` (see [`OnnxConfig`]): index and query with the
     /// same value. Verifies size, then sha256 of both files (~20 ms for the 34 MB model in a
     /// release build on an M4 Pro, measured), so a corrupted or swapped file is never loaded.
-    /// Symlinked model directories and files are refused. Offline.
+    /// A symlinked `models_dir` root is allowed; a symlinked `<id>` directory or model file is
+    /// refused. Offline.
     pub fn load_with(models_dir: &Path, cfg: OnnxConfig) -> Result<Self> {
         // `models_dir` itself may be a symlink (users relocate ~/.pith or PITH_HOME; it is their
         // own path). The `<id>` dir and the files below it, which pull manages, may not be.
