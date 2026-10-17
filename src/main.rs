@@ -39,7 +39,12 @@ enum Command {
     },
     /// Show index statistics
     Stats,
-    Mcp,
+    /// Serve the index read-only to Claude Code over stdio (MCP)
+    Mcp {
+        /// Project directory (default: current directory)
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
     /// Manage the embedding model
     Model {
         #[command(subcommand)]
@@ -165,7 +170,12 @@ fn run(cli: Cli) -> Result<()> {
             print!("{}", render_stats(&stats_project(&root, &db)?));
             Ok(())
         }
-        Command::Mcp => Err(Error::NotImplemented("mcp")),
+        #[cfg(feature = "mcp")]
+        Command::Mcp { project } => pithdb::mcp::run(project),
+        #[cfg(not(feature = "mcp"))]
+        Command::Mcp { .. } => Err(Error::NotImplemented(
+            "mcp (built without the `mcp` feature)",
+        )),
     }
 }
 

@@ -16,10 +16,13 @@ clap = { version = "4.6.7", features = ["derive"] }
 ignore = "0.4.33"
 memmap2 = "0.9.11"
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "download-binaries", "tls-rustls"], optional = true }
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io"], optional = true }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
 sha2 = "0.11.1"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"], optional = true }
+tokio = { version = "1.53.3", default-features = false, features = ["rt"], optional = true }
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 zstd = "0.14.3"
 
@@ -31,10 +34,11 @@ path = "src/main.rs"
 default = ["onnx", "mcp"]
 # ONNX Runtime (prebuilt, statically linked; fetched at build time) + HF tokenizers.
 onnx = ["dep:ort", "dep:tokenizers"]
-mcp = []
+mcp = ["dep:rmcp", "dep:tokio", "dep:serde"]
 
 [dev-dependencies]
 proptest = "1.12.0"
+serde_json = "1.0.154"
 
 [target."cfg(unix)".dependencies]
 rustix = { version = "1.1.5", features = ["fs", "process"] }

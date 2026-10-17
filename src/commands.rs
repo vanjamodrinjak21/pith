@@ -392,15 +392,18 @@ pub fn stats_project(root: &Path, db: &Db) -> Result<Stats> {
         indexed_at_unix: at,
         age_secs: unix_now().saturating_sub(at),
         git_head: db.meta().git_head.as_deref().map(|h| {
-            let ok = matches!(h.len(), 40 | 64)
-                && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-            if ok {
+            if valid_head(h) {
                 h.to_string()
             } else {
                 "(invalid)".to_string()
             }
         }),
     })
+}
+
+/// A recorded git head is shown only when it is 40/64 lowercase hex.
+pub(crate) fn valid_head(h: &str) -> bool {
+    matches!(h.len(), 40 | 64) && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub fn age(secs: u64) -> String {

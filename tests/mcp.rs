@@ -1,0 +1,211 @@
+#![cfg(feature = "mcp")]
+
+use pithdb::mcp::fit_budget;
+use pithdb::SearchHit;
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+fn hit(id: u32, path: &str, lines: usize) -> SearchHit {
+    SearchHit {
+        chunk_id: id,
+        score: 1.0,
+        path: path.into(),
+        start_line: 1,
+        end_line: lines as u32,
+        text: (1..=lines)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        source_changed: false,
+    }
+}
+
+#[test]
+fn fit_budget_caps_three_hits_per_file() {
+    let hits = (0..5)
+        .map(|i| hit(i, "a.rs", 3))
+        .chain([hit(9, "b.rs", 3)])
+        .collect();
+    let out = fit_budget(hits, 4000, 3, 15);
+    let ids: Vec<u32> = out.iter().map(|h| h.chunk_id).collect();
+    assert_eq!(ids, [0, 1, 2, 9]);
+}
+
+#[test]
+fn fit_budget_stops_before_exceeding_token_cap() {
+    let big = |id| SearchHit {
+        text: "x".repeat(1000),
+        ..hit(id, &format!("f{id}.rs"), 1)
+    };
+    let out = fit_budget((0..10).map(big).collect(), 1000, 3, 15);
+    assert!(!out.is_empty() && out.len() < 4, "{}", out.len());
+    let tokens: usize = out
+        .iter()
+        .map(|h| (h.text.chars().count() + h.path.chars().count()) / 4)
+        .sum();
+    assert!(tokens <= 1000, "{tokens}");
+    // Order is kept: it stops, it does not skip ahead.
+    assert_eq!(out.last().unwrap().chunk_id as usize, out.len() - 1);
+}
+
+#[test]
+fn fit_budget_trims_snippets_to_15_lines() {
+    let out = fit_budget(vec![hit(0, "a.rs", 40)], 4000, 3, 15);
+    assert_eq!(out[0].text.lines().count(), 15);
+    assert!(out[0].text.ends_with("line 15"));
+}
+
+struct Session {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl Session {
+    fn start(project: &Path, home: &Path, fake: bool) -> Session {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_pith"));
+        c.args(["mcp", "--project"])
+            .arg(project)
+            .env("PITH_HOME", home)
+            .env_remove("PITH_TEST_FAKE_EMBEDDER")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if fake {
+            c.env("PITH_TEST_FAKE_EMBEDDER", "1");
+        }
+        let mut child = c.spawn().expect("spawn pith mcp");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut s = Session {
+            child,
+            stdin,
+            stdout,
+            next_id: 1,
+        };
+        let r = s.request(
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        assert_eq!(r["result"]["serverInfo"]["name"], "pith", "{r}");
+        s.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        s
+    }
+
+    fn send(&mut self, v: Value) {
+        writeln!(self.stdin, "{v}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    /// Every stdout line must be a JSON-RPC message: nothing else may print there.
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.stdout.read_line(&mut line).unwrap() > 0,
+                "server closed"
+            );
+            let v: Value = serde_json::from_str(&line).expect("stdout line is JSON");
+            if v["id"] == id {
+                return v;
+            }
+        }
+    }
+
+    /// (is_error, text) of a tools/call.
+    fn call(&mut self, name: &str, args: Value) -> (bool, String) {
+        let r = self.request("tools/call", json!({"name": name, "arguments": args}));
+        let res = &r["result"];
+        assert!(res.is_object(), "{r}");
+        let text = res["content"][0]["text"].as_str().unwrap_or_default();
+        (res["isError"] == true, text.to_string())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn fixture() -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("lib.rs"), "fn alpha() {\n    1\n}\n").unwrap();
+    pithdb::index_project(d.path(), &pithdb::embed::FakeEmbedder, false).unwrap();
+    d
+}
+
+#[test]
+fn stdio_session_lists_three_tools_and_searches() {
+    let d = fixture();
+    let mut s = Session::start(d.path(), &d.path().join("home"), true);
+    let r = s.request("tools/list", json!({}));
+    let mut names: Vec<&str> = r["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["get_chunk", "search_code", "stats"]);
+
+    let q = "fn alpha() {\n    1\n}";
+    let (err, text) = s.call("search_code", json!({"query": q, "k": 3}));
+    assert!(!err, "{text}");
+    assert!(text.contains("lib.rs:1-3"), "{text}");
+    assert!(text.contains("indexed "), "staleness missing: {text}");
+    assert!(text.contains("fn alpha()"), "{text}");
+
+    let (err, text) = s.call("get_chunk", json!({"chunk_id": 0}));
+    assert!(!err && text.contains("fn alpha()"), "{text}");
+    let (err, text) = s.call("stats", json!({}));
+    assert!(!err && text.contains("fake-384"), "{text}");
+    // Boundary validation.
+    let (err, text) = s.call("search_code", json!({"query": "  "}));
+    assert!(err, "{text}");
+    let (err, text) = s.call("search_code", json!({"query": "x".repeat(5000)}));
+    assert!(err, "{text}");
+}
+
+#[test]
+fn get_chunk_unknown_id_is_a_tool_error_not_a_crash() {
+    let d = fixture();
+    let mut s = Session::start(d.path(), &d.path().join("home"), true);
+    let (err, text) = s.call("get_chunk", json!({"chunk_id": 999}));
+    assert!(err && text.contains("999"), "{text}");
+    let (err, _) = s.call("stats", json!({}));
+    assert!(!err, "server still serves after the error");
+}
+
+#[test]
+fn no_project_found_reported_not_guessed() {
+    let d = tempfile::tempdir().unwrap();
+    let empty = d.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let mut s = Session::start(&empty, &d.path().join("home"), true);
+    for (tool, args) in [
+        ("stats", json!({})),
+        ("search_code", json!({"query": "x"})),
+        ("get_chunk", json!({"chunk_id": 0})),
+    ] {
+        let (err, text) = s.call(tool, args);
+        assert!(err && text.contains("no Pith index"), "{tool}: {text}");
+    }
+}
+
+#[cfg(feature = "onnx")]
+#[test]
+fn search_code_with_no_model_says_run_pith_init() {
+    let d = fixture();
+    let mut s = Session::start(d.path(), &d.path().join("home"), false);
+    let (err, text) = s.call("search_code", json!({"query": "alpha"}));
+    assert!(err && text.contains("run `pith init`"), "{text}");
+}

@@ -8,6 +8,7 @@ pub mod embed;
 pub mod error;
 pub mod index;
 pub mod ingest;
+#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod storage;
 
