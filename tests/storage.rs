@@ -392,6 +392,10 @@ fn decompression_is_bounded_by_stated_raw_length() {
     // Small payload claiming a huge raw length: refused before decompressing.
     let m = corrupt_msg(&assemble(4, 0, &packed, 1 << 40));
     assert!(m.contains("over limit"), "{m}");
+    // Claims the full 1 GiB maximum with a tiny payload: rejected cleanly, having
+    // reserved only ~packed.len() * 64 + 4 KiB.
+    let m = corrupt_msg(&assemble(4, 0, &packed, 1 << 30));
+    assert!(m.contains(&format!("{} bytes, header says {}", raw.len(), 1u64 << 30)), "{m}");
     // Claims more than it holds.
     let m = corrupt_msg(&assemble(4, 0, &packed, raw.len() as u64 + 100));
     assert!(m.contains("header says"), "{m}");

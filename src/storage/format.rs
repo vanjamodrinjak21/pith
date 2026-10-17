@@ -66,6 +66,8 @@ pub const MIN_LEN: usize = HEADER_LEN + 32;
 /// Upper bound for the decompressed chunk table.
 pub const MAX_TABLE_RAW: u64 = 1 << 30;
 const ALIGN: usize = 64;
+/// Up-front decompression reservation per compressed byte (text rarely exceeds it).
+const RESERVE_RATIO: u64 = 64;
 const ZSTD_LEVEL: i32 = 3;
 
 pub struct Decoded {
@@ -232,17 +234,22 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Decompresses exactly `raw_len` bytes; more or fewer is corruption. The output
-/// buffer is reserved once at `raw_len + 1` (so at most `MAX_TABLE_RAW + 1`; a
-/// lying header can reserve up to that, which is virtual until written), and the
-/// decoder refuses frames whose window exceeds what `raw_len` needs.
+/// Decompresses exactly `raw_len` bytes; more or fewer is corruption. Up front it
+/// reserves at most `compressed_len * RESERVE_RATIO + 4 KiB` (fallibly), so a lying
+/// header cannot force a large allocation; the decoder refuses frames whose window
+/// exceeds what `raw_len` needs.
 fn decompress_bounded(src: &[u8], raw_len: u64) -> Result<Vec<u8>> {
     if raw_len > MAX_TABLE_RAW {
         return Err(corrupt(format!("chunk table length {raw_len} over limit")));
     }
     let err = |e: std::io::Error| corrupt(format!("chunk section: {e}"));
-    // Exact reservation (never above the cap); the +1 byte detects overlong output.
-    let mut out = Vec::with_capacity(raw_len as usize + 1);
+    // Reserve in proportion to the input, not the header's claim, and fallibly;
+    // the buffer grows past that only as bytes are really produced (<= raw_len + 1,
+    // the +1 detecting overlong output).
+    let reserve = (raw_len + 1).min(src.len() as u64 * RESERVE_RATIO + 4096);
+    let mut out = Vec::new();
+    out.try_reserve_exact(reserve as usize)
+        .map_err(|_| corrupt(format!("cannot reserve {reserve} bytes for chunk table")))?;
     // A frame needs no window larger than its content; refuse frames declaring more.
     let window_log = (64 - raw_len.leading_zeros()).clamp(10, 31);
     let mut dec = zstd::stream::read::Decoder::new(src).map_err(err)?;
