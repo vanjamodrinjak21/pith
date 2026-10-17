@@ -3,8 +3,9 @@
 
 use crate::embed::Embedder;
 use crate::ingest::{collect, CollectReport, SkipReason};
-use crate::storage::{locate_project, Db, IndexMeta, StoredChunk};
+use crate::storage::{locate_project, Db, IndexMeta, StoredChunk, WriterLock};
 use crate::{index::VectorIndex, Error, Result};
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -76,12 +77,12 @@ fn check_existing(db_path: &Path, embedder: &dyn Embedder) -> Result<()> {
     }
     match Db::open(db_path, Some((embedder.model_id(), embedder.dim()))) {
         Ok(_) => Ok(()),
-        Err(e @ (Error::ModelMismatch { .. } | Error::UnsupportedFormat(_))) => Err(e),
-        Err(Error::CorruptDb(m)) => Err(Error::CorruptDb(format!(
-            "existing .pith is unreadable ({m}); run `pith index --reindex` to rebuild it"
-        ))),
-        Err(e) => Err(Error::Invalid(format!(
-            "existing .pith cannot be read ({e}); run `pith index --reindex` to rebuild it"
+        // The real cause (permissions, ...) must not be dressed up as corruption.
+        Err(e @ (Error::Io(_) | Error::ModelMismatch { .. } | Error::UnsupportedFormat(_))) => {
+            Err(e)
+        }
+        Err(e) => Err(Error::CorruptDb(format!(
+            "existing .pith is unreadable ({e}); run `pith index --reindex` to rebuild it"
         ))),
     }
 }
@@ -107,14 +108,28 @@ fn git_head(root: &Path) -> Option<String> {
 }
 
 /// Appends `.pith` and `.pith.lock` to an existing `<root>/.gitignore` when not already listed.
-/// Never creates the file and never rewrites existing content.
+/// Never creates the file and never rewrites existing content. The file is opened without
+/// following a symlink and checked as a regular file on the open handle; all reads and the
+/// append go through that handle.
 fn update_gitignore(root: &Path) -> Result<()> {
-    let path = root.join(".gitignore");
-    match path.symlink_metadata() {
-        Ok(m) if m.is_file() => {}
-        _ => return Ok(()),
+    use std::io::{Read, Write};
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut o,
+        (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+    );
+    let mut f = match o.open(root.join(".gitignore")) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if !f.metadata()?.is_file() {
+        return Err(Error::Invalid(".gitignore is not a regular file".into()));
     }
-    let bytes = std::fs::read(&path)?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
     let text = String::from_utf8_lossy(&bytes);
     let listed = |name: &str| {
         text.lines()
@@ -134,11 +149,7 @@ fn update_gitignore(root: &Path) -> Result<()> {
     if !bytes.is_empty() && !bytes.ends_with(b"\n") {
         add.insert(0, '\n');
     }
-    use std::io::Write;
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)?
-        .write_all(add.as_bytes())?;
+    f.write_all(add.as_bytes())?;
     Ok(())
 }
 
@@ -148,6 +159,9 @@ fn update_gitignore(root: &Path) -> Result<()> {
 /// after it has done its embedding work. Progress goes to stderr, only when stderr is a TTY.
 pub fn index_project(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Result<IndexReport> {
     let db_path = root.join(DB_NAME);
+    // Fail fast if another writer is active, before the expensive embedding. Racy by nature: a
+    // writer may start after this check, in which case `Db::write` still returns Locked.
+    drop(WriterLock::acquire(&db_path)?);
     if !reindex {
         check_existing(&db_path, embedder)?;
     }
@@ -188,9 +202,9 @@ pub fn index_project(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Res
     }
     let files = chunks
         .iter()
-        .enumerate()
-        .filter(|(i, c)| *i == 0 || chunks[i - 1].path != c.path)
-        .count();
+        .map(|c| c.path.as_str())
+        .collect::<HashSet<_>>()
+        .len();
     let stored = chunks
         .into_iter()
         .map(|c| StoredChunk {
@@ -205,7 +219,10 @@ pub fn index_project(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Res
         git_head: git_head(root),
     };
     Db::write(&db_path, embedder.model_id(), stored, &index, meta)?;
-    update_gitignore(root)?;
+    // The index is already written; a .gitignore problem must not fail the run.
+    if let Err(e) = update_gitignore(root) {
+        eprintln!("pith: warning: could not update .gitignore: {e}");
+    }
     Ok(IndexReport {
         chunks: total,
         files,
@@ -264,7 +281,7 @@ fn changed_since(root: &Path, rel: &str, indexed_at_unix: u64) -> bool {
         .is_none_or(|d| d.as_secs() > indexed_at_unix)
 }
 
-/// Top-`k` chunks for `query` (k clamped to 1..=100). `root` is the project root, used only to
+/// Top-`k` chunks for `query` (k must be at least 1; capped at 100). `root` is the project root, used only to
 /// compute `source_changed`. Errors with `ModelMismatch` if the embedder is not the one that
 /// built the database.
 pub fn search_project(
@@ -274,6 +291,12 @@ pub fn search_project(
     query: &str,
     k: usize,
 ) -> Result<Vec<SearchHit>> {
+    if query.trim().is_empty() {
+        return Err(Error::Invalid("query must not be empty".into()));
+    }
+    if k == 0 {
+        return Err(Error::Invalid("k must be at least 1".into()));
+    }
     if db.model_id() != embedder.model_id() || db.index().dim() != embedder.dim() {
         return Err(Error::ModelMismatch {
             expected: embedder.model_id().into(),
@@ -283,7 +306,7 @@ pub fn search_project(
         });
     }
     let q = embedder.embed_query(query)?;
-    let hits = db.index().try_search(&q, k.clamp(1, MAX_K))?;
+    let hits = db.index().try_search(&q, k.min(MAX_K))?;
     let at = db.meta().indexed_at_unix;
     Ok(hits
         .into_iter()
@@ -302,29 +325,102 @@ pub fn search_project(
         .collect())
 }
 
-/// Summary of the database at `db_path`; needs no embedding model.
-pub fn stats_project(db_path: &Path) -> Result<Stats> {
-    let db = Db::open(db_path, None)?;
-    let n = db.index().len();
-    let mut files = 0;
-    let mut prev: Option<&str> = None;
-    for i in 0..n {
-        let p = db.chunk(i as u32).map(|c| c.path.as_str());
-        if p != prev {
-            files += 1;
-            prev = p;
-        }
-    }
+/// Summary of an open database; needs no embedding model. Strings that come from the file are
+/// sanitised: a git head that is not 40/64 lowercase hex becomes "(invalid)".
+pub fn stats_project(root: &Path, db: &Db) -> Result<Stats> {
+    let chunks = db.index().len();
+    let files = (0..chunks as u32)
+        .filter_map(|i| db.chunk(i).map(|c| c.path.as_str()))
+        .collect::<HashSet<_>>()
+        .len();
     let at = db.meta().indexed_at_unix;
     Ok(Stats {
-        chunks: n,
+        chunks,
         files,
-        model_id: db.model_id().into(),
-        db_bytes: std::fs::metadata(db_path)?.len(),
+        model_id: clean(db.model_id()),
+        db_bytes: std::fs::metadata(root.join(DB_NAME))?.len(),
         indexed_at_unix: at,
         age_secs: now_unix().saturating_sub(at),
-        git_head: db.meta().git_head.clone(),
+        git_head: db.meta().git_head.as_deref().map(|h| {
+            let ok = matches!(h.len(), 40 | 64)
+                && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            if ok {
+                h.to_string()
+            } else {
+                "(invalid)".to_string()
+            }
+        }),
     })
+}
+
+pub fn age(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs} seconds ago"),
+        60..=3599 => format!("{} minutes ago", secs / 60),
+        3600..=86399 => format!("{} hours ago", secs / 3600),
+        _ => format!("{} days ago", secs / 86400),
+    }
+}
+
+/// First 3 lines, each cut to 100 chars, indented, control characters scrubbed.
+pub fn snippet(text: &str) -> String {
+    text.lines()
+        .take(3)
+        .map(|l| format!("    {}", clean(&l.chars().take(100).collect::<String>())))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Plain-text search output: rank, score, location, snippet, then a staleness footer.
+pub fn render_search(hits: &[SearchHit], indexed_at_unix: u64, now_unix: u64) -> String {
+    let mut out = String::new();
+    for (i, h) in hits.iter().enumerate() {
+        let mark = if h.source_changed {
+            "  [source changed]"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "{}. {:.2}  {}:{}-{}{mark}\n{}\n",
+            i + 1,
+            h.score,
+            clean(&h.path),
+            h.start_line,
+            h.end_line,
+            snippet(&h.text)
+        ));
+    }
+    let changed = hits.iter().filter(|h| h.source_changed).count();
+    out.push_str(&format!(
+        "indexed {}; {changed} of {} results have changed sources\n",
+        age(now_unix.saturating_sub(indexed_at_unix)),
+        hits.len()
+    ));
+    out
+}
+
+pub fn render_stats(s: &Stats) -> String {
+    let mut out = format!(
+        "chunks:  {}\nfiles:   {}\nmodel:   {}\ndb size: {} bytes\nindexed: {}\n",
+        s.chunks,
+        s.files,
+        s.model_id,
+        s.db_bytes,
+        age(s.age_secs)
+    );
+    if let Some(h) = &s.git_head {
+        out.push_str(&format!("git head: {h}\n"));
+    }
+    out
+}
+
+/// `[Y/n]` answer: empty, `y` or `yes` (any case) is yes; everything else is no.
+pub fn is_yes(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
+}
+
+pub fn now() -> u64 {
+    now_unix()
 }
 
 /// Compact stderr summary of skipped files: count per reason plus up to 5 example paths.
@@ -364,10 +460,15 @@ pub fn skip_summary(skipped: &[(String, SkipReason)]) -> String {
         .join("\n")
 }
 
-/// Replaces control characters so file-derived text cannot drive the terminal.
-pub fn clean(s: &str) -> String {
+/// Replaces control characters (tab becomes a space) so file-derived text cannot drive the
+/// terminal. Apply to every string that comes from the database or the indexed files.
+pub(crate) fn clean(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| match c {
+            '\t' => ' ',
+            c if c.is_control() => '?',
+            c => c,
+        })
         .collect()
 }
 
@@ -389,6 +490,23 @@ mod tests {
             std::os::unix::fs::symlink("/etc", r.join("link")).unwrap();
             assert_eq!(safe_join(r, "link/passwd"), None);
         }
+    }
+
+    #[test]
+    fn age_and_snippet_format() {
+        assert_eq!(age(5), "5 seconds ago");
+        assert_eq!(age(120), "2 minutes ago");
+        assert_eq!(age(7200), "2 hours ago");
+        assert_eq!(age(3 * 86400), "3 days ago");
+        let s = snippet("a\tb\n\x1b[31mred\nc\nd");
+        assert_eq!(s, "    a b\n    ?[31mred\n    c");
+        assert!(snippet(&"x".repeat(500)).len() == 104);
+    }
+
+    #[test]
+    fn yes_answers() {
+        assert!(is_yes("") && is_yes("Y\n") && is_yes(" yes "));
+        assert!(!is_yes("n") && !is_yes("yep") && !is_yes("no"));
     }
 
     #[test]

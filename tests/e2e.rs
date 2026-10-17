@@ -1,5 +1,6 @@
 use pithdb::embed::{Embedder, FakeEmbedder};
-use pithdb::storage::Db;
+use pithdb::index::VectorIndex;
+use pithdb::storage::{Db, IndexMeta, StoredChunk};
 use pithdb::{index_project, open_project, search_project, stats_project, Error, Result};
 use std::fs;
 use std::path::Path;
@@ -124,26 +125,22 @@ fn source_changed_flag_true_after_file_edit() {
     }
 }
 
+#[cfg(unix)]
 #[test]
-fn tampered_stored_paths_are_flagged_not_followed() {
+fn symlinked_source_file_is_flagged_changed() {
     let d = project();
     index_project(d.path(), &FakeEmbedder, false).unwrap();
     let (root, db) = open(d.path());
-    // The unit tests cover safe_join directly; here: a symlinked file counts as changed.
-    #[cfg(unix)]
-    {
-        fs::remove_file(d.path().join("b.rs")).unwrap();
-        std::os::unix::fs::symlink("/etc/hosts", d.path().join("b.rs")).unwrap();
-        let q = db.chunk(1).unwrap().text.clone();
-        let hits = search_project(&root, &db, &FakeEmbedder, &q, 3).unwrap();
-        assert!(
-            hits.iter()
-                .find(|h| h.path == "b.rs")
-                .unwrap()
-                .source_changed
-        );
-    }
-    let _ = (root, db);
+    fs::remove_file(d.path().join("b.rs")).unwrap();
+    std::os::unix::fs::symlink("/etc/hosts", d.path().join("b.rs")).unwrap();
+    let q = db.chunk(1).unwrap().text.clone();
+    let hits = search_project(&root, &db, &FakeEmbedder, &q, 3).unwrap();
+    assert!(
+        hits.iter()
+            .find(|h| h.path == "b.rs")
+            .unwrap()
+            .source_changed
+    );
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -160,6 +157,7 @@ fn git(dir: &Path, args: &[&str]) {
 #[test]
 fn index_sets_git_head_only_in_git_repos() {
     if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("skipping index_sets_git_head_only_in_git_repos: git not found");
         return;
     }
     let plain = project();
@@ -199,7 +197,10 @@ fn index_sets_git_head_only_in_git_repos() {
 fn stats_reports_chunks_files_age() {
     let d = project();
     index_project(d.path(), &FakeEmbedder, false).unwrap();
-    let s = stats_project(&d.path().join(".pith")).unwrap();
+    let s = {
+        let (r, db) = open(d.path());
+        stats_project(&r, &db).unwrap()
+    };
     assert_eq!((s.chunks, s.files), (3, 3));
     assert_eq!(s.model_id, "fake-384");
     assert!(s.age_secs < 60 && s.db_bytes > 0);
@@ -245,22 +246,142 @@ fn secret_file_never_appears_in_results() {
 }
 
 #[test]
-fn k_is_clamped() {
-    let d = project();
-    index_project(d.path(), &FakeEmbedder, false).unwrap();
-    let (root, db) = open(d.path());
+fn k_is_capped_at_100_and_zero_is_an_error() {
+    let d = tempfile::tempdir().unwrap();
+    for i in 0..150 {
+        fs::write(
+            d.path().join(format!("f{i}.txt")),
+            format!("file number {i}\n"),
+        )
+        .unwrap();
+    }
     assert_eq!(
-        search_project(&root, &db, &FakeEmbedder, "x", 0)
+        index_project(d.path(), &FakeEmbedder, false)
             .unwrap()
-            .len(),
-        1
+            .chunks,
+        150
     );
+    let (root, db) = open(d.path());
     assert_eq!(
         search_project(&root, &db, &FakeEmbedder, "x", usize::MAX)
             .unwrap()
             .len(),
-        3
+        100
     );
+    assert_eq!(
+        search_project(&root, &db, &FakeEmbedder, "x", 7)
+            .unwrap()
+            .len(),
+        7
+    );
+    let e = search_project(&root, &db, &FakeEmbedder, "x", 0).unwrap_err();
+    assert!(matches!(e, Error::Invalid(ref m) if m.contains("k must be at least 1")));
+}
+
+#[test]
+fn empty_query_is_rejected() {
+    let d = project();
+    index_project(d.path(), &FakeEmbedder, false).unwrap();
+    let (root, db) = open(d.path());
+    for q in ["", "   \n\t"] {
+        let e = search_project(&root, &db, &FakeEmbedder, q, 3).unwrap_err();
+        assert!(matches!(e, Error::Invalid(ref m) if m.contains("query must not be empty")));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_gitignore_is_left_untouched_and_index_succeeds() {
+    let d = project();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("shared-ignore");
+    fs::write(&target, "target/\n").unwrap();
+    std::os::unix::fs::symlink(&target, d.path().join(".gitignore")).unwrap();
+    index_project(d.path(), &FakeEmbedder, false).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target/\n");
+    assert!(d
+        .path()
+        .join(".gitignore")
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn second_writer_fails_fast_with_locked() {
+    let d = project();
+    let _held = pithdb::storage::WriterLock::acquire(&d.path().join(".pith")).unwrap();
+    let e = index_project(d.path(), &FakeEmbedder, false).unwrap_err();
+    assert!(matches!(e, Error::Locked));
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_existing_index_reports_the_io_error_not_corruption() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = project();
+    index_project(d.path(), &FakeEmbedder, false).unwrap();
+    let p = d.path().join(".pith");
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+    let r = index_project(d.path(), &FakeEmbedder, false);
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+    match r {
+        Err(Error::Io(_)) => {}
+        // Running as root ignores the mode bits.
+        Ok(_) => {}
+        Err(e) => panic!("expected Io, got {e}"),
+    }
+}
+
+fn tampered_db(root: &Path, model: &str, head: &str) {
+    let idx = VectorIndex::build(vec![vec![1.0; 384]]).unwrap();
+    let c = StoredChunk {
+        path: "a\x1b[2Jb.rs".into(),
+        start_line: 1,
+        end_line: 1,
+        text: "t".into(),
+    };
+    let meta = IndexMeta {
+        indexed_at_unix: 1,
+        git_head: Some(head.into()),
+    };
+    Db::write(&root.join(".pith"), model, vec![c], &idx, meta).unwrap();
+}
+
+#[test]
+fn escape_sequences_from_a_tampered_db_never_reach_output() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+    tampered_db(&root, "m\x1b[31m-384", "\x1b]0;pwn\x07");
+    let out = Command::new(env!("CARGO_BIN_EXE_pith"))
+        .arg("stats")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!out.stdout.contains(&0x1b) && !out.stderr.contains(&0x1b));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("(invalid)") && text.contains("m?[31m-384"),
+        "{text}"
+    );
+
+    let e = index_project(&root, &FakeEmbedder, false).unwrap_err();
+    assert!(matches!(e, Error::ModelMismatch { .. }));
+    assert!(!e.to_string().contains('\x1b'), "{e}");
+
+    let (_, db) = open(&root);
+    let hits = vec![pithdb::SearchHit {
+        chunk_id: 0,
+        score: 1.0,
+        path: db.chunk(0).unwrap().path.clone(),
+        start_line: 1,
+        end_line: 1,
+        text: "\x1b[0m".into(),
+        source_changed: true,
+    }];
+    assert!(!pithdb::render_search(&hits, 1, 2).contains('\x1b'));
 }
 
 #[cfg(feature = "onnx")]

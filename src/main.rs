@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use pithdb::embed::{models_dir, pull, DEFAULT_MODEL};
 use pithdb::{
-    index_project, load_default_embedder, open_project, search_project, skip_summary,
-    stats_project, Error, Result,
+    index_project, is_yes, load_default_embedder, now, open_project, render_search, render_stats,
+    search_project, skip_summary, stats_project, Error, Result,
 };
 use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -64,7 +64,7 @@ fn pull_default() -> Result<()> {
 }
 
 /// Presence by size only; the embedder verifies hashes on load.
-fn model_present(dir: &Path) -> Vec<(&'static str, &'static str)> {
+fn model_files(dir: &Path) -> Vec<(&'static str, &'static str)> {
     DEFAULT_MODEL
         .files
         .iter()
@@ -81,7 +81,7 @@ fn model_present(dir: &Path) -> Vec<(&'static str, &'static str)> {
 
 fn init(yes: bool) -> Result<()> {
     let dir = models_dir()?;
-    if model_present(&dir).iter().all(|(_, s)| *s == "present") {
+    if model_files(&dir).iter().all(|(_, s)| *s == "present") {
         println!("model {} is already installed", DEFAULT_MODEL.id);
         return Ok(());
     }
@@ -90,13 +90,12 @@ fn init(yes: bool) -> Result<()> {
             false
         } else {
             eprint!(
-                "Download {} (~34 MB) to {}? [Y/n] ",
+                "Download {} (~34 MB) to {}? [Y/n] (Enter or y downloads; anything else cancels) ",
                 DEFAULT_MODEL.id,
                 dir.display()
             );
             let mut line = String::new();
-            let n = std::io::stdin().lock().read_line(&mut line)?;
-            n > 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
+            std::io::stdin().lock().read_line(&mut line)? > 0 && is_yes(&line)
         }
     };
     if !go {
@@ -104,31 +103,6 @@ fn init(yes: bool) -> Result<()> {
         return Ok(());
     }
     pull_default()
-}
-
-fn age(secs: u64) -> String {
-    match secs {
-        0..=59 => format!("{secs} seconds ago"),
-        60..=3599 => format!("{} minutes ago", secs / 60),
-        3600..=86399 => format!("{} hours ago", secs / 3600),
-        _ => format!("{} days ago", secs / 86400),
-    }
-}
-
-fn snippet(text: &str) -> String {
-    text.lines()
-        .take(3)
-        .map(|l| {
-            let l: String = l.chars().take(100).collect();
-            format!(
-                "    {}",
-                l.chars()
-                    .map(|c| if c.is_control() { ' ' } else { c })
-                    .collect::<String>()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -145,7 +119,7 @@ fn run(cli: Cli) -> Result<()> {
                 "default model: {} ({}-d)",
                 DEFAULT_MODEL.id, DEFAULT_MODEL.dim
             );
-            for (f, s) in model_present(&dir) {
+            for (f, s) in model_files(&dir) {
                 println!("  {f}: {s}");
             }
             println!("location: {}", dir.join(DEFAULT_MODEL.id).display());
@@ -169,46 +143,12 @@ fn run(cli: Cli) -> Result<()> {
             let (root, db) = open_project(&std::env::current_dir()?)?;
             let embedder = load_default_embedder()?;
             let hits = search_project(&root, &db, embedder.as_ref(), &query, k)?;
-            for (i, h) in hits.iter().enumerate() {
-                let mark = if h.source_changed {
-                    "  [source changed]"
-                } else {
-                    ""
-                };
-                println!(
-                    "{}. {:.2}  {}:{}-{}{mark}\n{}",
-                    i + 1,
-                    h.score,
-                    pithdb::commands::clean(&h.path),
-                    h.start_line,
-                    h.end_line,
-                    snippet(&h.text)
-                );
-            }
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            let changed = hits.iter().filter(|h| h.source_changed).count();
-            println!(
-                "indexed {}; {changed} of {} results have changed sources",
-                age(now.saturating_sub(db.meta().indexed_at_unix)),
-                hits.len()
-            );
+            print!("{}", render_search(&hits, db.meta().indexed_at_unix, now()));
             Ok(())
         }
         Command::Stats => {
-            let cwd = std::env::current_dir()?;
-            let path = pithdb::storage::locate_project(&cwd)
-                .ok_or_else(|| Error::NoIndex(cwd.display().to_string()))?;
-            let s = stats_project(&path)?;
-            println!("chunks:  {}", s.chunks);
-            println!("files:   {}", s.files);
-            println!("model:   {}", s.model_id);
-            println!("db size: {} bytes", s.db_bytes);
-            println!("indexed: {}", age(s.age_secs));
-            if let Some(h) = s.git_head {
-                println!("git head: {h}");
-            }
+            let (root, db) = open_project(&std::env::current_dir()?)?;
+            print!("{}", render_stats(&stats_project(&root, &db)?));
             Ok(())
         }
         Command::Mcp => Err(Error::NotImplemented("mcp")),

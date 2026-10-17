@@ -12,7 +12,7 @@ pub enum Error {
     NonFinite,
     #[error("corrupt index: {0}")]
     CorruptIndex(String),
-    #[error("database was built with model {found} ({found_dim}-d), expected {expected} ({expected_dim}-d); run `pith index --reindex`")]
+    #[error("database was built with model {} ({found_dim}-d), expected {} ({expected_dim}-d); run `pith index --reindex`", crate::commands::clean(.found), crate::commands::clean(.expected))]
     ModelMismatch {
         expected: String,
         expected_dim: usize,
