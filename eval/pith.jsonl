@@ -5,26 +5,26 @@
 {"query": "dot_i8_rows", "expect": ["src/index/kernel.rs:30-60"]}
 {"query": "quantize_one scale_for", "expect": ["src/index/quant.rs"]}
 {"query": "is_public_dns_name", "expect": ["src/embed/pull.rs:306-337"]}
-{"query": "has_private_key_header", "expect": ["src/ingest/walk.rs:300-308"]}
+{"query": "check_table_len", "expect": ["src/storage/format.rs:145-168"]}
 {"query": "cls_pool_normalize", "expect": ["src/embed/mod.rs:62-85"]}
 {"query": "decompress_bounded", "expect": ["src/storage/format.rs:375-415"]}
 {"query": "LineCap poll_read", "expect": ["src/mcp/mod.rs:140-198"]}
 {"query": "split_parts", "expect": ["src/index/bm25.rs"]}
 {"query": "update_gitignore", "expect": ["src/commands.rs:150-228"]}
-{"query": "MAX_FILE_BYTES", "expect": ["src/ingest/walk.rs"]}
+{"query": "MAX_FILE_BYTES", "expect": ["src/ingest/mod.rs:30-70"]}
 {"query": "QUERY_PREFIX", "expect": ["src/embed/onnx.rs:1-40"]}
 {"query": "is_denied", "expect": ["src/ingest/deny.rs:160-235"]}
 {"query": "Pca::fit", "expect": ["src/tui/model.rs:150-216"]}
 {"query": "FakeEmbedder", "expect": ["src/embed/mod.rs:87-125"]}
 {"query": "another writer holds the database lock", "expect": ["src/error.rs", "src/storage/lock.rs"]}
 {"query": "credentials in URLs are not supported", "expect": ["src/embed/pull.rs:255-295"]}
-{"query": "file changed during walk", "expect": ["src/ingest/walk.rs:245-300"]}
+{"query": "redirects from a loopback base URL must stay on loopback", "expect": ["src/embed/pull.rs:255-295"]}
 {"query": "MCP message longer than the line limit", "expect": ["src/mcp/tools.rs", "src/mcp/mod.rs:140-198"]}
 {"query": "query is longer than characters", "expect": ["src/mcp/tools.rs:100-115"]}
 {"query": "existing .pith is unreadable", "expect": ["src/commands.rs:110-130"]}
 {"query": "quantized data does not match full vectors", "expect": ["src/index/mod.rs:30-60"]}
 {"query": "k must be at least 1", "expect": ["src/commands.rs:616-640"]}
-{"query": "how are secret files kept out of the index", "expect": ["src/ingest/deny.rs", "src/ingest/walk.rs:245-308", "src/ingest/mod.rs"]}
+{"query": "how are secret files kept out of the index", "expect": ["src/ingest/deny.rs", "src/ingest/mod.rs"]}
 {"query": "where is the downloaded model checked against its sha256", "expect": ["src/embed/pull.rs:82-186"]}
 {"query": "how is the database file replaced atomically", "expect": ["src/storage/mod.rs"]}
 {"query": "how is the on-disk layout validated when opening", "expect": ["src/storage/format.rs"]}
