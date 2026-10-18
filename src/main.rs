@@ -45,6 +45,16 @@ enum Command {
         #[arg(long)]
         project: Option<PathBuf>,
     },
+    /// Explore the index in the terminal: stacked tree, vector map, search
+    #[cfg(feature = "tui")]
+    Ui {
+        /// Project directory (default: current directory)
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Start indexing the project right away (works without an index)
+        #[arg(long)]
+        index: bool,
+    },
     /// Manage the embedding model
     Model {
         #[command(subcommand)]
@@ -170,6 +180,8 @@ fn run(cli: Cli) -> Result<()> {
             print!("{}", render_stats(&stats_project(&root, &db)?));
             Ok(())
         }
+        #[cfg(feature = "tui")]
+        Command::Ui { project, index } => pithdb::tui::run(project, index),
         #[cfg(feature = "mcp")]
         Command::Mcp { project } => pithdb::mcp::run(project),
         #[cfg(not(feature = "mcp"))]

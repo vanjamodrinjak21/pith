@@ -17,7 +17,9 @@ bytemuck = "1.25.2"
 clap = { version = "4.6.7", features = ["derive"] }
 ignore = "0.4.33"
 memmap2 = "0.9.11"
+crossterm = { version = "0.29.0", default-features = false, features = ["events"], optional = true }
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "download-binaries", "tls-rustls"], optional = true }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"], optional = true }
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io"], optional = true }
 serde = { version = "1.0.229", features = ["derive"], optional = true }
 sha2 = "0.11.1"
@@ -46,10 +48,12 @@ name = "pith"
 path = "src/main.rs"
 
 [features]
-default = ["onnx", "mcp"]
+default = ["onnx", "mcp", "tui"]
 # ONNX Runtime (prebuilt, statically linked; fetched at build time) + HF tokenizers.
 onnx = ["dep:ort", "dep:tokenizers"]
 mcp = ["dep:rmcp", "dep:tokio", "dep:serde"]
+# `pith ui`: read-only terminal explorer.
+tui = ["dep:ratatui", "dep:crossterm"]
 # Test-only: enables PITH_TEST_FAKE_EMBEDDER, which makes `pith mcp` use a fake embedder.
 # Off by default, and compiled only when debug assertions are on, so release and bench
 # profiles never contain it even with the feature enabled. This crate's own dev-dependency turns it on.

@@ -82,6 +82,40 @@ per snippet. The server never indexes or writes: run `pith index` first, and aga
 changes (a reindex is picked up without restarting). The embedding model loads on the first
 search and is dropped after 5 idle minutes.
 
+## Terminal UI
+
+```sh
+pith ui                   # explore the index of the project in the current directory
+pith ui --index           # index first (works before the first `pith index`), then explore
+```
+
+Four views:
+
+- **Stack**: directory -> file -> chunk, sorted by chunk count, with a bar for each entry's share
+  of the index and a preview of the selected chunk.
+- **Map**: every chunk vector projected to 2-D (PCA, up to 20,000 points), coloured by top-level
+  directory and shaded by density. Move the cursor to preview the nearest chunk. After a query
+  it marks the query and the chunks sent to Claude.
+- **RAG**: runs a query exactly like the MCP `search_code` tool and shows what Claude would
+  receive: the ranked candidates with scores, which were sent, trimmed or dropped (3-per-file
+  cap, 4,000-token cap, k = 8), a token meter, and the final text.
+- **Index**: reindexes the project live: files and chunks done, chunks/s, ETA, the current
+  file, skipped files and the reasons, and the embedded chunks filling a map. Cancelling keeps
+  the previous index.
+
+| Key | Action |
+| --- | --- |
+| `1`-`4`, `Tab`, `Shift-Tab` | switch view (`Tab` in RAG toggles ranked hits / context) |
+| `j` `k`, arrows | move; scroll the context |
+| `Enter`, `Space`, `h` `l` | expand or collapse a directory; open or leave a file's chunks |
+| `/` | type a query; `Enter` runs it |
+| `i` | index now; `Esc` or `c` cancels |
+| `r` | reload the index after a `pith index` elsewhere |
+| `?` | help |
+| `q`, `Esc` | quit |
+
+`pith ui` needs an interactive terminal. Built with the default `tui` feature (ratatui).
+
 ## Performance
 
 Measured on an M4 Pro, release build.

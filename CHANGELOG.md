@@ -7,6 +7,13 @@ specifically the [variant used by Rust](http://doc.crates.io/manifest.html#the-v
 The on-disk format is unstable until 1.0.
 
 ## [Unreleased] - TBD
+### Added
+- `pith ui`: a terminal UI (default `tui` feature) with four views: Stack (directory -> file ->
+  chunk with share-of-index bars), Map (2-D PCA of the vectors with density shading), RAG (what
+  `search_code` sends Claude, with dropped/trimmed hits and a token meter) and Index (live,
+  cancellable reindex with progress). `pith ui --index` indexes first.
+- `index_project_with_progress`, `Progress` and `Error::Cancelled` in the library.
+- `VectorIndex::scale`.
 
 ## [0.1.1] - 2026-10-18
 ### Added
