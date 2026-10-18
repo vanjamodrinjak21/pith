@@ -20,6 +20,7 @@ pub use locate::{locate_project, locate_project_within};
 #[doc(hidden)]
 pub use lock::WriterLock;
 
+use crate::index::bm25::Bm25;
 use crate::index::VectorIndex;
 use crate::{Error, Result};
 use std::fs::File;
@@ -47,6 +48,8 @@ pub struct Db {
     chunks: Vec<StoredChunk>,
     hashes: Vec<[u8; 32]>,
     index: VectorIndex,
+    /// Keyword index, built from the chunk texts on the first keyword or hybrid search.
+    keywords: std::sync::OnceLock<Bm25>,
 }
 
 /// Read-only shared mapping of the whole file. The only `unsafe` in storage.
@@ -89,6 +92,7 @@ impl Db {
             chunks: d.chunks,
             hashes: d.hashes,
             index: d.index,
+            keywords: std::sync::OnceLock::new(),
         })
     }
 
@@ -147,6 +151,12 @@ impl Db {
     /// Takes the index out; it keeps the mapping alive after the `Db` is gone.
     pub fn into_index(self) -> VectorIndex {
         self.index
+    }
+
+    /// The BM25 index over the chunk texts, built on first call.
+    pub(crate) fn keywords(&self) -> &Bm25 {
+        self.keywords
+            .get_or_init(|| Bm25::build(self.chunks.iter().map(|c| c.text.as_str())))
     }
 
     pub fn meta(&self) -> &IndexMeta {

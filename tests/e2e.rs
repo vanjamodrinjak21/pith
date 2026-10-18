@@ -1,7 +1,10 @@
 use pithdb::embed::{Embedder, FakeEmbedder};
 use pithdb::index::VectorIndex;
 use pithdb::storage::{Db, IndexMeta, StoredChunk};
-use pithdb::{index_project, open_project, search_project, stats_project, Error, Result};
+use pithdb::{
+    index_project, open_project, search_project, search_with, stats_project, Error, Result,
+    SearchMode,
+};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -507,4 +510,56 @@ fn error_messages_with_escape_bytes_in_paths_are_scrubbed() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stderr).contains("f?[2J is not a directory"));
+}
+
+#[test]
+fn keyword_search_needs_no_model_and_finds_the_identifier() {
+    let d = project();
+    index_project(d.path(), &FakeEmbedder, false).unwrap();
+    let (root, db) = open(d.path());
+    for mode in [SearchMode::Keyword, SearchMode::Hybrid] {
+        let hits = search_with(&root, &db, None, "beta", 5, mode).unwrap();
+        assert_eq!(hits.len(), 1, "{mode:?}: {hits:?}");
+        assert_eq!((hits[0].path.as_str(), hits[0].score), ("b.rs", 1.0));
+    }
+    // An embedder is ignored in keyword mode, even one that cannot embed.
+    let hits = search_with(&root, &db, Some(&Failing), "gamma", 5, SearchMode::Keyword).unwrap();
+    assert_eq!(hits[0].path, "c.md");
+    let e = search_with(&root, &db, None, "beta", 5, SearchMode::Vector).unwrap_err();
+    assert!(matches!(e, Error::ModelMissing(_)), "{e:?}");
+}
+
+#[test]
+fn hybrid_scores_are_cosines_and_keyword_hits_join_the_ranking() {
+    let d = project();
+    index_project(d.path(), &FakeEmbedder, false).unwrap();
+    let (root, db) = open(d.path());
+    let hybrid = search_with(
+        &root,
+        &db,
+        Some(&FakeEmbedder),
+        "beta",
+        3,
+        SearchMode::Hybrid,
+    )
+    .unwrap();
+    let vector = search_with(
+        &root,
+        &db,
+        Some(&FakeEmbedder),
+        "beta",
+        3,
+        SearchMode::Vector,
+    )
+    .unwrap();
+    // The fake embedder ranks by hash, so "beta" reaches the top only through the keyword list.
+    assert_eq!(hybrid[0].path, "b.rs");
+    for h in &hybrid {
+        let v = vector.iter().find(|v| v.chunk_id == h.chunk_id).unwrap();
+        assert!((h.score - v.score).abs() < 1e-6, "{h:?} vs {v:?}");
+    }
+    assert_eq!(
+        hybrid,
+        search_project(&root, &db, &FakeEmbedder, "beta", 3).unwrap()
+    );
 }

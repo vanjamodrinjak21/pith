@@ -29,7 +29,7 @@ pub enum Error {
     CorruptDb(String),
     #[error("invalid input: {0}")]
     Invalid(String),
-    #[error("embedding model not found: {0}; run `pith model pull` to download it")]
+    #[error("embedding model not found: {0}; run `pith init` to download it")]
     ModelMissing(String),
     #[error("model download failed: {0}")]
     Download(String),

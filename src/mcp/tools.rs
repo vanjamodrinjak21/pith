@@ -1,7 +1,10 @@
 use super::State;
 use crate::budget::{clean_block, context, DEFAULT_K as K_DEFAULT, MAX_PER_FILE, MAX_TOKENS};
 use crate::commands::{clean, unix_now};
-use crate::{render_error, render_stats, search_project, stats_project, Error};
+use crate::{
+    is_no_model, render_error, render_stats, search_project, search_with, stats_project, Error,
+    SearchMode, KEYWORD_ONLY,
+};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::schemars::JsonSchema;
@@ -49,7 +52,7 @@ fn reply(r: crate::Result<String>) -> Result<String, String> {
 
 #[tool_router]
 impl Server {
-    /// Semantic search over the indexed project. Returns a few capped snippets (about 15 lines
+    /// Hybrid (semantic + keyword) search over the indexed project. Returns a few capped snippets (about 15 lines
     /// each, at most 3 per file) with path, line range, score and chunk_id, plus index staleness.
     #[tool]
     async fn search_code(&self, Parameters(a): Parameters<SearchArgs>) -> Result<String, String> {
@@ -119,9 +122,17 @@ impl Server {
         let k = clamp_k(k);
         self.state.with_db(|root, db| {
             // Over-fetch so the per-file cap still leaves up to k results.
-            let hits = self
+            let n = k * MAX_PER_FILE;
+            let (hits, notice) = match self
                 .state
-                .with_embedder(|e| search_project(root, db, e, query, k * MAX_PER_FILE))?;
+                .with_embedder(|e| search_project(root, db, e, query, n))
+            {
+                Err(e) if is_no_model(&e) => (
+                    search_with(root, db, None, query, n, SearchMode::Hybrid)?,
+                    Some(KEYWORD_ONLY),
+                ),
+                r => (r?, None),
+            };
             let meta = db.meta();
             let c = context(
                 &hits,
@@ -129,6 +140,7 @@ impl Server {
                 meta.indexed_at_unix,
                 unix_now(),
                 k,
+                notice,
             );
             Ok(c.text)
         })

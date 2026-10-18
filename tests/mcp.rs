@@ -170,13 +170,13 @@ fn no_project_found_reported_not_guessed() {
     }
 }
 
-#[cfg(feature = "onnx")]
 #[test]
-fn search_code_with_no_model_says_run_pith_init() {
+fn search_code_with_no_model_falls_back_to_keywords() {
     let d = fixture();
     let mut s = Session::start(d.path(), &d.path().join("home"), false);
     let (err, text) = s.call("search_code", json!({"query": "alpha"}));
-    assert!(err && text.contains("run `pith init`"), "{text}");
+    assert!(!err && text.contains("lib.rs:1-3"), "{text}");
+    assert!(text.contains(pithdb::KEYWORD_ONLY), "{text}");
 }
 
 #[test]

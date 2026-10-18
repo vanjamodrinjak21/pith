@@ -1,13 +1,13 @@
 [package]
 name = "pithdb"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.92"
 description = "Pith: lightweight local vector database with built-in ONNX embeddings and an MCP server for code search"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vanjamodrinjak21/pith"
 readme = "README.md"
-exclude = [".superpowers/", ".claude/", ".remember/", ".madelog/", ".github/", "docs/", "PRD.md"]
+exclude = [".superpowers/", ".claude/", ".remember/", ".madelog/", ".github/", "docs/", "eval/", ".pithignore", "PRD.md"]
 keywords = ["vector-database", "embeddings", "onnx", "search"]
 categories = ["database-implementations"]
 

@@ -2,6 +2,7 @@
 //! which are then rescored with f32 dot products. Not strictly exact: a true top-k vector
 //! could be lost in the int8 pass (recall is checked in tests/index_reference.rs).
 
+pub(crate) mod bm25;
 pub(crate) mod kernel;
 mod quant;
 

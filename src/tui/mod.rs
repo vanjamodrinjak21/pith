@@ -11,7 +11,7 @@ mod view;
 use crate::budget::{context, DEFAULT_K, MAX_PER_FILE};
 use crate::commands::{
     clean, gitignore_warning, gitignore_warning_for, index_project_with_progress, open_project,
-    render_error, search_project, unix_now,
+    render_error, search_with, unix_now, SearchMode, KEYWORD_ONLY,
 };
 use crate::embed::Embedder;
 use crate::storage::{Db, StoredChunk};
@@ -507,7 +507,7 @@ pub fn run(project: Option<PathBuf>, index: bool) -> Result<()> {
                 state.status = "searching...".into();
                 terminal.draw(|f| view::draw(f, &state, &data))?;
                 state.status = match search_lazy(&mut embedder, &data, &mut state, &q) {
-                    Ok(msg) => msg.into(),
+                    Ok(msg) => msg,
                     Err(e) => message(&e),
                 };
             }
@@ -521,14 +521,17 @@ fn search_lazy(
     d: &Data,
     s: &mut State,
     q: &str,
-) -> Result<&'static str> {
+) -> Result<String> {
     clear_results(s); // also when loading the model fails
     if embedder.is_none() {
-        *embedder = Some((crate::load_default_embedder()?, Instant::now()));
+        match crate::load_optional_embedder()? {
+            Some(e) => *embedder = Some((e, Instant::now())),
+            None => return search(None, d, s, q),
+        }
     }
     let (e, used) = embedder.as_mut().expect("set above");
     *used = Instant::now();
-    search(e.as_ref(), d, s, q)
+    search(Some(e.as_ref()), d, s, q)
 }
 
 /// Runs `q` the way `search_code` does and returns a status message; projects the query and
@@ -538,20 +541,22 @@ fn clear_results(s: &mut State) {
     (s.hit, s.scroll) = (0, 0);
 }
 
-fn search(e: &dyn Embedder, d: &Data, s: &mut State, q: &str) -> Result<&'static str> {
+/// Without an embedder the search is keyword-only and says so.
+fn search(e: Option<&dyn Embedder>, d: &Data, s: &mut State, q: &str) -> Result<String> {
     clear_results(s);
     let db =
         d.db.as_ref()
             .ok_or_else(|| Error::NoIndex(d.root.display().to_string()))?;
     // Over-fetched exactly like search_code, so the dropped hits are the ones Claude never sees.
-    let hits = search_project(&d.root, db, e, q, DEFAULT_K * MAX_PER_FILE)?;
+    let n = DEFAULT_K * MAX_PER_FILE;
+    let hits = search_with(&d.root, db, e, q, n, SearchMode::Hybrid)?;
     let index = db.index();
     let pca = d.map.pca.as_ref();
     // shortcut: embeds the query a second time for its map position (a few ms); search_project
     // does not return the vector.
-    let query_point = match pca {
-        Some(p) => p.project_vector(&e.embed_query(q)?, index.scale()),
-        None => None,
+    let query_point = match (pca, e) {
+        (Some(p), Some(e)) => p.project_vector(&e.embed_query(q)?, index.scale()),
+        _ => None,
     };
     let dim = index.dim();
     s.hit_points = hits
@@ -564,6 +569,7 @@ fn search(e: &dyn Embedder, d: &Data, s: &mut State, q: &str) -> Result<&'static
             pca?.project_row(row)
         })
         .collect();
+    let notice = e.is_none().then_some(KEYWORD_ONLY);
     let meta = db.meta();
     s.context = Some(context(
         &hits,
@@ -571,10 +577,15 @@ fn search(e: &dyn Embedder, d: &Data, s: &mut State, q: &str) -> Result<&'static
         meta.indexed_at_unix,
         unix_now(),
         DEFAULT_K,
+        notice,
     ));
     s.query_point = query_point;
     s.hits = hits;
-    Ok(if s.hits.is_empty() { "no results" } else { "" })
+    Ok(match (s.hits.is_empty(), notice) {
+        (true, Some(n)) => format!("no results; {n}"),
+        (true, None) => "no results".into(),
+        (false, n) => n.unwrap_or_default().into(),
+    })
 }
 
 #[cfg(test)]
@@ -811,7 +822,7 @@ mod tests {
         let mut d = Data::load(dir.path()).unwrap();
         d.poll_map(true);
         let mut s = State::new(&d.tree, &d.map);
-        search(&FakeEmbedder, &d, &mut s, "fn f0_1() {}").unwrap();
+        search(Some(&FakeEmbedder), &d, &mut s, "fn f0_1() {}").unwrap();
         assert!(!s.hits.is_empty() && s.query_point.is_some() && s.context.is_some());
         s.hit = 3;
         /// Same model id, wrong dimension: search_project refuses it.
@@ -830,9 +841,25 @@ mod tests {
                 Ok(vec![1.0, 0.0, 0.0])
             }
         }
-        assert!(search(&Wrong, &d, &mut s, "x").is_err());
+        assert!(search(Some(&Wrong), &d, &mut s, "x").is_err());
         assert!(s.hits.is_empty() && s.context.is_none() && s.query_point.is_none());
         assert!(s.hit_points.is_empty() && s.hit == 0);
+    }
+
+    #[test]
+    fn search_without_a_model_is_keyword_only_and_says_so() {
+        let dir = project(2);
+        crate::index_project(dir.path(), &FakeEmbedder, false).unwrap();
+        let mut d = Data::load(dir.path()).unwrap();
+        d.poll_map(true);
+        let mut s = State::new(&d.tree, &d.map);
+        assert_eq!(search(None, &d, &mut s, "f0_1").unwrap(), KEYWORD_ONLY);
+        assert!(!s.hits.is_empty() && s.query_point.is_none());
+        assert!(s.context.as_ref().unwrap().text.contains(KEYWORD_ONLY));
+        assert_eq!(
+            search(None, &d, &mut s, "zzzz").unwrap(),
+            format!("no results; {KEYWORD_ONLY}")
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Chunks per `embed_passages` call. Progress granularity only: the ONNX embedder runs its own
 /// batch size (default 1, see `OnnxConfig`) inside each call, so vectors do not depend on this.
 const EMBED_GROUP: usize = 32;
-const MAX_K: usize = 100;
+pub(crate) const MAX_K: usize = 100;
 const DB_NAME: &str = ".pith";
 
 #[derive(Debug)]
@@ -99,7 +99,6 @@ pub fn load_default_embedder() -> Result<Box<dyn Embedder>> {
 }
 
 /// Error text when the build has no embedding support.
-#[cfg(not(feature = "onnx"))]
 pub(crate) const NO_ONNX: &str =
     "this build of pith has no embedding model support (built without the `onnx` feature)";
 
@@ -498,7 +497,7 @@ pub fn open_project(start: &Path) -> Result<(PathBuf, Db)> {
 
 /// Resolves a stored relative path under `root`, refusing absolute paths, `..`, and any symlink
 /// along the way (the indexer never follows them). None means "do not touch the filesystem".
-fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
+pub(crate) fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     if rel.is_empty() || rel.contains('\0') || (cfg!(windows) && rel.contains('\\')) {
         return None;
     }
@@ -538,9 +537,64 @@ fn changed_since(root: &Path, rel: &str, indexed_at_unix: u64) -> bool {
         .is_none_or(|d| d.as_secs() > indexed_at_unix)
 }
 
-/// Top-`k` chunks for `query` (k must be at least 1; capped at 100). `root` is the project
-/// root, used only to compute `source_changed`. Errors with `ModelMismatch` if the embedder is
-/// not the one that built the database.
+/// How [`search_with`] ranks chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    /// Cosine similarity of embeddings only.
+    Vector,
+    /// BM25 over identifier-aware tokens only; needs no embedding model.
+    Keyword,
+    /// Reciprocal rank fusion of the vector and keyword rankings.
+    #[default]
+    Hybrid,
+}
+
+impl SearchMode {
+    pub const ALL: [SearchMode; 3] = [SearchMode::Vector, SearchMode::Keyword, SearchMode::Hybrid];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SearchMode::Vector => "vector",
+            SearchMode::Keyword => "keyword",
+            SearchMode::Hybrid => "hybrid",
+        }
+    }
+}
+
+impl std::str::FromStr for SearchMode {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        SearchMode::ALL
+            .into_iter()
+            .find(|m| m.name() == s)
+            .ok_or_else(|| format!("unknown mode {s:?}; use vector, keyword or hybrid"))
+    }
+}
+
+/// Candidates taken from each ranking before fusion.
+const FUSE_N: usize = 50;
+/// The reciprocal rank fusion constant: a hit at rank r adds 1 / (RRF_K + r).
+const RRF_K: f32 = 60.0;
+
+/// Shown when hybrid search runs without a model and falls back to keyword search.
+pub const KEYWORD_ONLY: &str =
+    "no embedding model: keyword search only (run `pith init` for semantic search)";
+
+/// True when `e` means no embedding model is available: not installed, or not built in.
+pub fn is_no_model(e: &Error) -> bool {
+    matches!(e, Error::ModelMissing(_)) || matches!(e, Error::Invalid(m) if m == NO_ONNX)
+}
+
+/// [`load_default_embedder`], or None when no model is available (see [`is_no_model`]).
+pub fn load_optional_embedder() -> Result<Option<Box<dyn Embedder>>> {
+    match load_default_embedder() {
+        Ok(e) => Ok(Some(e)),
+        Err(e) if is_no_model(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Top-`k` chunks for `query` by hybrid search (see [`search_with`]).
 pub fn search_project(
     root: &Path,
     db: &Db,
@@ -548,30 +602,92 @@ pub fn search_project(
     query: &str,
     k: usize,
 ) -> Result<Vec<SearchHit>> {
+    search_with(root, db, Some(embedder), query, k, SearchMode::Hybrid)
+}
+
+/// Top-`k` chunks for `query` (k must be at least 1; capped at 100). `root` is the project
+/// root, used only to compute `source_changed`. Errors with `ModelMismatch` if the embedder is
+/// not the one that built the database. Without an embedder, `Hybrid` is keyword-only and
+/// `Vector` is an error.
+///
+/// `score` is the cosine similarity whenever an embedder is given (also for a hybrid hit found
+/// only by keyword); keyword-only results carry the BM25 score divided by the top one, so the
+/// first is 1.0. Hybrid results are ordered by fused rank, not by `score`.
+pub fn search_with(
+    root: &Path,
+    db: &Db,
+    embedder: Option<&dyn Embedder>,
+    query: &str,
+    k: usize,
+    mode: SearchMode,
+) -> Result<Vec<SearchHit>> {
     if query.trim().is_empty() {
         return Err(Error::Invalid("query must not be empty".into()));
     }
     if k == 0 {
         return Err(Error::Invalid("k must be at least 1".into()));
     }
-    if db.model_id() != embedder.model_id() || db.index().dim() != embedder.dim() {
-        return Err(Error::ModelMismatch {
-            expected: embedder.model_id().into(),
-            expected_dim: embedder.dim(),
-            found: db.model_id().into(),
-            found_dim: db.index().dim(),
-        });
-    }
-    let q = embedder.embed_query(query)?;
-    let hits = db.index().try_search(&q, k.min(MAX_K))?;
+    let k = k.min(MAX_K);
+    let embedder = if mode == SearchMode::Keyword {
+        None
+    } else {
+        embedder
+    };
+    let q = match embedder {
+        Some(e) => {
+            if db.model_id() != e.model_id() || db.index().dim() != e.dim() {
+                return Err(Error::ModelMismatch {
+                    expected: e.model_id().into(),
+                    expected_dim: e.dim(),
+                    found: db.model_id().into(),
+                    found_dim: db.index().dim(),
+                });
+            }
+            Some(e.embed_query(query)?)
+        }
+        None if mode == SearchMode::Vector => {
+            return Err(Error::ModelMissing(
+                "vector search needs the embedding model".into(),
+            ))
+        }
+        None => None,
+    };
+    let ranked: Vec<(u32, f32)> = match &q {
+        Some(q) if mode == SearchMode::Vector => db
+            .index()
+            .try_search(q, k)?
+            .into_iter()
+            .map(|h| (h.id, h.score))
+            .collect(),
+        Some(q) => {
+            let n = k.max(FUSE_N);
+            let vector: Vec<u32> = db.index().try_search(q, n)?.iter().map(|h| h.id).collect();
+            let keyword: Vec<u32> = db.keywords().search(query, n).iter().map(|h| h.0).collect();
+            let full = db.index().full();
+            let dim = db.index().dim();
+            fuse(&vector, &keyword, k)
+                .into_iter()
+                .map(|id| {
+                    let row = &full[id as usize * dim..][..dim];
+                    (id, row.iter().zip(q).map(|(a, b)| a * b).sum())
+                })
+                .collect()
+        }
+        None => {
+            let mut hits = db.keywords().search(query, k);
+            let top = hits.first().map_or(1.0, |h| h.1);
+            hits.iter_mut().for_each(|h| h.1 /= top);
+            hits
+        }
+    };
     let at = db.meta().indexed_at_unix;
-    Ok(hits
+    Ok(ranked
         .into_iter()
-        .filter_map(|h| {
-            let c = db.chunk(h.id)?;
+        .filter_map(|(id, score)| {
+            let c = db.chunk(id)?;
             Some(SearchHit {
-                chunk_id: h.id,
-                score: h.score,
+                chunk_id: id,
+                score,
                 path: c.path.clone(),
                 start_line: c.start_line,
                 end_line: c.end_line,
@@ -580,6 +696,20 @@ pub fn search_project(
             })
         })
         .collect())
+}
+
+/// Reciprocal rank fusion of two rankings (best first): the top `k` ids by the sum of
+/// 1 / (RRF_K + rank) over the rankings that hold them, ties by ascending id.
+fn fuse(a: &[u32], b: &[u32], k: usize) -> Vec<u32> {
+    let mut score: HashMap<u32, f32> = HashMap::new();
+    for list in [a, b] {
+        for (r, &id) in list.iter().enumerate() {
+            *score.entry(id).or_default() += 1.0 / (RRF_K + r as f32 + 1.0);
+        }
+    }
+    let mut ids: Vec<(u32, f32)> = score.into_iter().collect();
+    ids.sort_by(|x, y| y.1.total_cmp(&x.1).then(x.0.cmp(&y.0)));
+    ids.into_iter().take(k).map(|(id, _)| id).collect()
 }
 
 /// Summary of an open database; needs no embedding model. Strings that come from the file are
@@ -899,6 +1029,26 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "x\n");
         }
+    }
+
+    #[test]
+    fn fusion_is_deterministic_and_ties_break_by_id() {
+        // 7 is first in one list and absent from the other; 3 and 5 are in both.
+        assert_eq!(fuse(&[7, 3, 5], &[3, 5, 9], 10), [3, 5, 7, 9]);
+        // Mirrored positions score equally: the lower id wins.
+        assert_eq!(fuse(&[4, 2], &[2, 4], 10), [2, 4]);
+        assert_eq!(fuse(&[8], &[6], 10), [6, 8]);
+        assert_eq!(fuse(&[1, 2, 3], &[], 2), [1, 2]);
+        assert!(fuse(&[], &[], 5).is_empty());
+    }
+
+    #[test]
+    fn modes_parse_by_name() {
+        for m in SearchMode::ALL {
+            assert_eq!(m.name().parse::<SearchMode>(), Ok(m));
+        }
+        assert!("semantic".parse::<SearchMode>().is_err());
+        assert_eq!(SearchMode::default(), SearchMode::Hybrid);
     }
 
     #[test]
