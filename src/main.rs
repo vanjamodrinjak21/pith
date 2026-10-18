@@ -154,11 +154,7 @@ fn run(cli: Cli) -> Result<()> {
             if !r.skipped.is_empty() {
                 eprintln!("{}", skip_summary(&r.skipped));
             }
-            let secs = t.elapsed().as_secs_f64();
-            println!(
-                "indexed {} chunks from {} files in {secs:.1}s",
-                r.chunks, r.files
-            );
+            println!("{}", r.summary(t.elapsed().as_secs_f64()));
             Ok(())
         }
         Command::Search { query, k } => {
