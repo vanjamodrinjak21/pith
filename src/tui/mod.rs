@@ -507,7 +507,7 @@ pub fn run(project: Option<PathBuf>, index: bool) -> Result<()> {
                 state.status = "searching...".into();
                 terminal.draw(|f| view::draw(f, &state, &data))?;
                 state.status = match search_lazy(&mut embedder, &data, &mut state, &q) {
-                    Ok(msg) => msg.into(),
+                    Ok(msg) => msg,
                     Err(e) => message(&e),
                 };
             }
@@ -521,7 +521,7 @@ fn search_lazy(
     d: &Data,
     s: &mut State,
     q: &str,
-) -> Result<&'static str> {
+) -> Result<String> {
     clear_results(s); // also when loading the model fails
     if embedder.is_none() {
         match crate::load_optional_embedder()? {
@@ -542,7 +542,7 @@ fn clear_results(s: &mut State) {
 }
 
 /// Without an embedder the search is keyword-only and says so.
-fn search(e: Option<&dyn Embedder>, d: &Data, s: &mut State, q: &str) -> Result<&'static str> {
+fn search(e: Option<&dyn Embedder>, d: &Data, s: &mut State, q: &str) -> Result<String> {
     clear_results(s);
     let db =
         d.db.as_ref()
@@ -581,10 +581,10 @@ fn search(e: Option<&dyn Embedder>, d: &Data, s: &mut State, q: &str) -> Result<
     ));
     s.query_point = query_point;
     s.hits = hits;
-    Ok(match notice {
-        _ if s.hits.is_empty() => "no results",
-        Some(n) => n,
-        None => "",
+    Ok(match (s.hits.is_empty(), notice) {
+        (true, Some(n)) => format!("no results; {n}"),
+        (true, None) => "no results".into(),
+        (false, n) => n.unwrap_or_default().into(),
     })
 }
 
@@ -856,7 +856,10 @@ mod tests {
         assert_eq!(search(None, &d, &mut s, "f0_1").unwrap(), KEYWORD_ONLY);
         assert!(!s.hits.is_empty() && s.query_point.is_none());
         assert!(s.context.as_ref().unwrap().text.contains(KEYWORD_ONLY));
-        assert_eq!(search(None, &d, &mut s, "zzzz").unwrap(), "no results");
+        assert_eq!(
+            search(None, &d, &mut s, "zzzz").unwrap(),
+            format!("no results; {KEYWORD_ONLY}")
+        );
     }
 
     #[test]

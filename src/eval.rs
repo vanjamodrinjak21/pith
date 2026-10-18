@@ -4,7 +4,7 @@
 //! the first rank whose hit meets any of its expectations.
 
 use crate::budget::{context, tokens, DEFAULT_K, MAX_PER_FILE};
-use crate::commands::{clean, safe_join, search_with, unix_now, SearchMode};
+use crate::commands::{clean, safe_join, search_with, unix_now, SearchMode, MAX_K};
 use crate::embed::Embedder;
 use crate::storage::Db;
 use crate::{Error, Result, SearchHit};
@@ -55,13 +55,23 @@ impl Expect {
 }
 
 /// Parses a cases file; blank lines are skipped, anything else malformed is an error naming
-/// its line number.
+/// its line number, and a file with no cases is an error.
 pub fn parse_cases(text: &str) -> Result<Vec<Case>> {
-    text.lines()
+    let cases = text
+        .lines()
         .enumerate()
         .filter(|(_, l)| !l.trim().is_empty())
         .map(|(i, l)| parse_case(l).map_err(|e| Error::Invalid(format!("line {}: {e}", i + 1))))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    if cases.is_empty() {
+        return Err(Error::Invalid("the cases file has no cases".into()));
+    }
+    Ok(cases)
+}
+
+/// The k that searches actually use: 1 to 100.
+pub fn effective_k(k: usize) -> usize {
+    k.clamp(1, MAX_K)
 }
 
 /// The two-key subset of JSON that a case is: an object with a string `query` and a non-empty
@@ -258,8 +268,9 @@ pub fn run_eval(
     })
 }
 
-/// The comparison table, plus every miss when `verbose`.
-pub fn render_eval(scores: &[Score], k: usize, verbose: bool) -> String {
+/// The comparison table (a row per score, then a row per `skipped` mode), plus every miss when
+/// `verbose`.
+pub fn render_eval(scores: &[Score], skipped: &[SearchMode], k: usize, verbose: bool) -> String {
     let cases = scores.first().map_or(0, |s| s.cases);
     let mut out = format!(
         "{cases} cases, k = {k}\n{:<8} {:>6} {:>6} {:>7} {:>6} {:>8} {:>8} {:>9}\n",
@@ -284,6 +295,9 @@ pub fn render_eval(scores: &[Score], k: usize, verbose: bool) -> String {
             s.file_tokens,
             s.file_tokens / s.tokens.max(1.0)
         ));
+    }
+    for m in skipped {
+        out.push_str(&format!("{:<8} skipped (no embedding model)\n", m.name()));
     }
     out.push_str(
         "tokens: average search_code response; files: average size of the expected whole files\n",
@@ -370,6 +384,14 @@ mod tests {
         let s = score(SearchMode::Hybrid, &[Some(1), Some(2), Some(4), None]);
         assert_eq!((s.hit1, s.hit3, s.hitk), (0.25, 0.5, 0.75));
         assert_eq!(s.mrr, 1.75 / 4.0);
+        assert!(parse_cases("\n  \n")
+            .unwrap_err()
+            .to_string()
+            .contains("no cases"));
+        assert_eq!(
+            (effective_k(0), effective_k(7), effective_k(500)),
+            (1, 7, 100)
+        );
         let empty = score(SearchMode::Vector, &[]);
         assert_eq!((empty.hitk, empty.mrr), (0.0, 0.0));
     }

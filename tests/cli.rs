@@ -99,11 +99,7 @@ fn search_modes_without_a_model() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("pith model pull") || stderr.contains("onnx"),
-        "{stderr}"
-    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), no_model_error(&root));
     let out = pith(&root)
         .args(["search", "x", "--mode", "fuzzy"])
         .output()
@@ -112,7 +108,7 @@ fn search_modes_without_a_model() {
 }
 
 #[test]
-fn eval_reports_every_mode_and_names_bad_lines() {
+fn eval_degrades_without_a_model_and_names_bad_lines() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().canonicalize().unwrap();
     std::fs::write(root.join("a.rs"), "fn open_writer_lock() {}\n").unwrap();
@@ -143,16 +139,55 @@ fn eval_reports_every_mode_and_names_bad_lines() {
         stdout.contains("miss [keyword] \"nothing here\": \n"),
         "{stdout}"
     );
-    // Without a model, vector mode is an error.
-    assert!(!pith(&root)
-        .args(["eval", "cases.jsonl"])
+    // Without a model, all modes skip vector; only an explicit `--mode vector` is an error.
+    let out = pith(&root)
+        .args(["eval", "cases.jsonl", "-k", "500"])
         .output()
-        .unwrap()
-        .status
-        .success());
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.starts_with("2 cases, k = 100\n"), "{stdout}");
+    assert!(
+        stdout.contains("\nkeyword ") && stdout.contains("\nhybrid "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("vector   skipped (no embedding model)"),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches(pithdb::KEYWORD_ONLY).count(), 1, "{stderr}");
+    let out = pith(&root)
+        .args(["eval", "cases.jsonl", "--mode", "vector"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stderr), no_model_error(&root));
+    std::fs::write(root.join("empty.jsonl"), "\n").unwrap();
+    let out = pith(&root).args(["eval", "empty.jsonl"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no cases"));
 
     std::fs::write(root.join("bad.jsonl"), "\n{\"query\": 1}\n").unwrap();
     let out = pith(&root).args(["eval", "bad.jsonl"]).output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("line 2:"));
+}
+
+/// What `pith` prints when `--mode vector` finds no model under `<root>/home`.
+fn no_model_error(root: &std::path::Path) -> String {
+    if cfg!(feature = "onnx") {
+        let dir = root.join("home/models/bge-small-en-v1.5-int8");
+        format!(
+            "pith: embedding model not found: {}; run `pith init` to download it\n",
+            dir.display()
+        )
+    } else {
+        "pith: invalid input: this build of pith has no embedding model support (built without \
+         the `onnx` feature)\n"
+            .into()
+    }
 }

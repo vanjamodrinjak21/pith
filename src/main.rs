@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use pithdb::embed::{models_dir, pull, DEFAULT_MODEL};
-use pithdb::eval::{parse_cases, render_eval, run_eval};
+use pithdb::eval::{effective_k, parse_cases, render_eval, run_eval};
 use pithdb::{
     index_project, is_yes, load_default_embedder, load_optional_embedder, open_project,
     render_error, render_search, render_stats, search_with, skip_summary, stats_project, Error,
@@ -203,20 +203,28 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let cases = parse_cases(&std::fs::read_to_string(&cases)?)?;
             let (root, db) = open_project(&std::env::current_dir()?)?;
-            let modes = mode.map_or(SearchMode::ALL.to_vec(), |m| vec![m]);
-            let embedder = if modes == [SearchMode::Keyword] {
-                None
-            } else {
-                load_optional_embedder()?
+            let k = effective_k(k);
+            let mut modes = mode.map_or(SearchMode::ALL.to_vec(), |m| vec![m]);
+            let embedder = match mode {
+                Some(SearchMode::Vector) => Some(load_default_embedder()?),
+                Some(SearchMode::Keyword) => None,
+                _ => load_optional_embedder()?,
             };
-            if embedder.is_none() && modes.contains(&SearchMode::Hybrid) {
+            let mut skipped = Vec::new();
+            if embedder.is_none() && mode != Some(SearchMode::Keyword) {
                 eprintln!("pith: {KEYWORD_ONLY}");
+                modes.retain(|&m| m != SearchMode::Vector);
+                skipped = mode
+                    .is_none()
+                    .then_some(SearchMode::Vector)
+                    .into_iter()
+                    .collect();
             }
             let scores = modes
                 .into_iter()
                 .map(|m| run_eval(&root, &db, embedder.as_deref(), &cases, k, m))
                 .collect::<Result<Vec<_>>>()?;
-            print!("{}", render_eval(&scores, k, verbose));
+            print!("{}", render_eval(&scores, &skipped, k, verbose));
             Ok(())
         }
         Command::Stats => {

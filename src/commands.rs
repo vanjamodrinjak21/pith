@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Chunks per `embed_passages` call. Progress granularity only: the ONNX embedder runs its own
 /// batch size (default 1, see `OnnxConfig`) inside each call, so vectors do not depend on this.
 const EMBED_GROUP: usize = 32;
-const MAX_K: usize = 100;
+pub(crate) const MAX_K: usize = 100;
 const DB_NAME: &str = ".pith";
 
 #[derive(Debug)]

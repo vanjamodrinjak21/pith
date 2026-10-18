@@ -7,6 +7,7 @@ mod budget;
 pub mod commands;
 pub mod embed;
 pub mod error;
+#[doc(hidden)] // the engine of `pith eval`; not a stable library API
 pub mod eval;
 pub mod index;
 pub mod ingest;
