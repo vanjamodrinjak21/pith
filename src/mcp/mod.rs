@@ -134,6 +134,7 @@ pub fn run(project: Option<PathBuf>) -> Result<()> {
         }
     });
     tokio::runtime::Builder::new_current_thread()
+        .enable_time() // rmcp's service loop uses timers; without this closing stdin panics
         .build()?
         .block_on(tools::serve(state, MAX_LINE))
 }
@@ -143,11 +144,22 @@ pub(crate) struct LineCap<R> {
     inner: R,
     max: usize,
     run: usize,
+    tripped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<R> LineCap<R> {
     pub(crate) fn new(inner: R, max: usize) -> Self {
-        LineCap { inner, max, run: 0 }
+        LineCap {
+            inner,
+            max,
+            run: 0,
+            tripped: Arc::default(),
+        }
+    }
+
+    /// Set once an over-long line has been refused, so the caller can exit with an error status.
+    pub(crate) fn tripped(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.tripped.clone()
     }
 }
 
@@ -165,6 +177,8 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineCap<R> {
             for (i, seg) in new.split(|&b| b == b'\n').enumerate() {
                 run = if i == 0 { run + seg.len() } else { seg.len() };
                 if run > self.max {
+                    self.tripped
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     buf.set_filled(before);
                     return std::task::Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,

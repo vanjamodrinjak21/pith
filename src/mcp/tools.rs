@@ -168,17 +168,21 @@ pub(crate) async fn serve(state: Arc<State>, max_line: usize) -> crate::Result<(
         state,
         tool_router: Server::tool_router(),
     };
+    let input = super::LineCap::new(tokio::io::stdin(), max_line);
+    let tripped = input.tripped();
     let running = server
-        .serve((
-            super::LineCap::new(tokio::io::stdin(), max_line),
-            tokio::io::stdout(),
-        ))
+        .serve((input, tokio::io::stdout()))
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
     running
         .waiting()
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+    if tripped.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(Error::Invalid(
+            "MCP message longer than the line limit".into(),
+        ));
+    }
     Ok(())
 }
 

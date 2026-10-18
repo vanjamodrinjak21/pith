@@ -126,6 +126,25 @@ fn stdio_session_lists_three_tools_and_searches() {
 }
 
 #[test]
+fn closing_stdin_ends_the_session_cleanly() {
+    let d = fixture();
+    let mut s = Session::start(d.path(), &d.path().join("home"), true);
+    drop(s.stdin.take()); // client hangs up
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(st) = s.child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server did not exit on EOF"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status}");
+}
+
+#[test]
 fn get_chunk_unknown_id_is_a_tool_error_not_a_crash() {
     let d = fixture();
     let mut s = Session::start(d.path(), &d.path().join("home"), true);
