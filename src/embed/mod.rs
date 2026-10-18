@@ -99,8 +99,10 @@ impl FakeEmbedder {
             .finalize_xof()
             .fill(&mut bytes);
         let mut v: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / u32::MAX as f32 - 0.5)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c) as f32 / u32::MAX as f32 - 0.5)
             .collect();
         normalize(&mut v).expect("hash output is finite and nonzero");
         v

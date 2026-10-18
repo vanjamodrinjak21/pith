@@ -148,11 +148,7 @@ impl VectorIndex {
     }
 
     pub fn len(&self) -> usize {
-        if self.dim == 0 {
-            0
-        } else {
-            self.full().len() / self.dim
-        }
+        self.full().len().checked_div(self.dim).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
