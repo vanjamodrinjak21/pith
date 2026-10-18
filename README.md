@@ -27,7 +27,7 @@ Features:
 
 ## Status
 
-Pith is `0.1`. macOS on Apple Silicon is the supported platform: that is where it is built and
+Pith is `0.1` and needs Rust 1.92 or newer to build. macOS on Apple Silicon is the supported platform: that is where it is built and
 tested (an M4 Pro; the release binary is about 38 MB). Linux and Windows are untested. There is
 no HNSW (search is a brute-force scan, see Performance), no incremental indexing and no
 non-code ingestion.
@@ -123,6 +123,11 @@ in principle a true top-k hit can be lost in the int8 pass.
 - A mapped `.pith` file that is truncated by another program while Pith runs crashes the process
   (SIGBUS). Pith itself only replaces the file by atomic rename.
 
+## Using Pith as a library
+
+See [`examples/search_project.rs`](examples/search_project.rs): index a directory and search it in
+about 20 lines (`cargo run --example search_project -- <directory> "<query>"`).
+
 ## Development
 
 ```sh
@@ -134,6 +139,10 @@ cargo clippy --all-targets -- -D warnings
 The ignored embedding tests need the real model (`pith init` first). The non-default
 `test-hooks` feature exists only for this crate's own tests (it lets `pith mcp` use a fake
 embedder) and is compiled only in debug builds, so release and bench builds never contain it.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for what Pith defends against and how to report a vulnerability.
 
 ## License
 
