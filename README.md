@@ -72,11 +72,24 @@ indexed 9 seconds ago; 0 of 3 results have changed sources
 | `vector` | cosine similarity of embeddings | yes (`run pith init`) |
 | `keyword` | BM25 (k1 = 1.2, b = 0.75) over identifier-aware tokens | no |
 
-The score shown is the cosine similarity whenever the model is loaded (hybrid results are
-ordered by fused rank, so scores need not decrease); keyword-only scores are BM25 divided by the
-top hit's, so the first is 1.00. The keyword index is built in memory from the chunk texts on the
-first keyword or hybrid query and never stored. A chunk contributes at most 1,024 tokens, and once
-the index holds 16 Mi postings (about 128 MiB) later chunks are not keyword-indexed.
+The score shown is the cosine similarity whenever the model is loaded. Hybrid results are
+ordered by fused rank, so scores need not decrease, and a hit found only by keyword can sit at
+rank 1 with a low cosine. Keyword-only scores are BM25 divided by the top hit's, so the first is
+1.00.
+
+The keyword index is built in memory from the chunk texts on the first keyword or hybrid query
+and never stored, so every process pays for it once: `pith search`, `pith mcp` (first
+`search_code` after start or after a reindex) and `pith ui`, whose first query waits for it. It
+takes under 10 ms on this repository and about 0.8 to 1.1 s at 100,000 chunks. Its memory is
+bounded: a chunk contributes at most 1,024 tokens, and every distinct term (at most 64 chars) and
+every posting costs one unit of a 32 Mi budget; a chunk that would start after the budget is spent
+is not keyword-indexed. A synthetic 100,000-chunk index used 12.1 M postings and 8 k terms (about
+a third of the budget) and raised peak RSS by 260 MiB during the build.
+
+Tokenizer limits: tokens are runs of letters, digits and `_`, lowercased, 2 to 64 chars, plus the
+parts of identifiers (`_`, camelCase, letter/digit changes). There is no stemming, no stop-word
+list and no Unicode normalization (NFC and NFD spellings differ), and a run of CJK text without
+spaces is a single token.
 
 Run `pith index` again after edits: chunks whose text is unchanged keep their vectors, so only
 changed chunks are embedded, and an unchanged project is reported up to date without rewriting
@@ -153,19 +166,29 @@ cost: the average size of what `search_code` would send against the average size
 whole files. `--verbose` lists the misses with what was returned.
 
 [`eval/pith.jsonl`](eval/pith.jsonl) holds 42 cases for this repository (26 identifier and
-error-string lookups, 16 questions), checked by hand against the code. On this repository
-(526 chunks, `bge-small-en-v1.5`, k = 10):
+error-string lookups, 16 questions), checked by hand against the code. Without the model,
+`pith eval` skips the vector mode and says so; only `--mode vector` is an error. On this
+repository (574 chunks, `bge-small-en-v1.5`, k = 10):
 
 | Mode | hit@1 | hit@3 | hit@10 | MRR | tokens sent | whole files |
 | --- | --- | --- | --- | --- | --- | --- |
-| vector | 0.50 | 0.67 | 0.90 | 0.62 | 1,325 | 4,961 |
-| keyword | 0.48 | 0.60 | 0.93 | 0.60 | 1,404 | 4,961 |
-| hybrid | 0.52 | 0.76 | 0.93 | 0.65 | 1,348 | 4,961 |
+| vector | 0.43 | 0.62 | 0.88 | 0.56 | 1,323 | 5,066 |
+| keyword | 0.40 | 0.52 | 0.93 | 0.54 | 1,413 | 5,066 |
+| hybrid | 0.40 | 0.64 | 0.95 | 0.57 | 1,357 | 5,066 |
 
-Hybrid is the default because it beats vector search on the identifier cases (MRR 0.63 vs 0.60,
-hit@3 0.73 vs 0.65) without losing on the questions (MRR 0.69 vs 0.66, hit@3 0.81 vs 0.69).
-Keyword search alone is best at hit@1 on identifiers (0.54) but weakest on questions. A
-`search_code` call costs about 3.7x fewer tokens than reading the expected files whole.
+Split by kind (MRR / hit@3 / hit@10):
+
+| Mode | identifiers (26) | questions (16) |
+| --- | --- | --- |
+| vector | 0.53 / 0.58 / 0.88 | 0.62 / 0.69 / 0.88 |
+| keyword | 0.62 / 0.62 / 0.96 | 0.40 / 0.38 / 0.88 |
+| hybrid | 0.55 / 0.58 / 0.96 | 0.61 / 0.75 / 0.94 |
+
+Hybrid is the default, though the margin is small: it finds more of the expected chunks in the
+top 10 than vector search (0.95 vs 0.88) and has the best MRR overall, but its hit@1 is lower
+(0.40 vs 0.43) and on the questions its MRR is level with vector search (0.61 vs 0.62). Keyword
+search alone is clearly best on identifiers and weakest on questions. A `search_code` call costs
+about 3.7x fewer tokens than reading the expected files whole.
 
 ## Performance
 
@@ -178,8 +201,8 @@ Measured on an M4 Pro, release build.
 | Embedding, 64 chunks, 8 threads | about 0.75 s, roughly 85 chunks/s |
 | `pith index` on this repository, first run (485 chunks, 47 files) | 11.9 s |
 | `pith index` again after editing one file (484 reused, 1 embedded) | 0.13 s wall clock, model load included |
-| Keyword index build, this repository (526 chunks) | under 10 ms (`pith search --mode keyword` takes 0.01 s in all) |
-| Keyword index build, 100k synthetic chunks of about 600 chars | 1.4 to 1.8 s, once per process (`cargo test --release --lib build_time -- --ignored`) |
+| Keyword index build, this repository (574 chunks) | under 10 ms (`pith search --mode keyword` takes 0.01 s in all) |
+| Keyword index build, 100k synthetic chunks of about 600 chars | 0.8 to 1.1 s, peak RSS +260 MiB, once per process (`cargo test --release --lib build_time -- --ignored`) |
 
 Embedding dominates indexing time. Batch size (8, 16, 32 or 64) makes no measurable difference,
 only the thread count does. Pith embeds with batch size 1 by default: the int8 model quantizes
@@ -196,7 +219,9 @@ in principle a true top-k hit can be lost in the int8 pass.
 - `source_changed` in results compares the file's mtime, in whole seconds, with the index time,
   so an edit in the same second as indexing is missed. (A file that was only touched is handled:
   the next `pith index` rewrites the index time.)
-- Secret detection is path-based plus a PEM-header content check. An in-tree hardlink to a secret
+- Secret detection is path-based plus a PEM-header content check. The check matches a header
+  anywhere in a line (JSON service-account files carry it mid-line), so a source file that
+  spells out a complete private-key header in a string or comment is skipped as a secret. An in-tree hardlink to a secret
   under another name is not caught by name, and headerless raw base64 keys are not caught by
   content. Directories named `.ssh`, `.gnupg`, `.aws` and `.kube` are never indexed.
 - The chunk table is bounded on decompression: an index whose table compresses better than
