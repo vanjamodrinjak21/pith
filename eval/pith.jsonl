@@ -11,7 +11,7 @@
 {"query": "LineCap poll_read", "expect": ["src/mcp/mod.rs:140-198"]}
 {"query": "split_parts", "expect": ["src/index/bm25.rs"]}
 {"query": "update_gitignore", "expect": ["src/commands.rs:150-228"]}
-{"query": "MAX_FILE_BYTES", "expect": ["src/ingest/mod.rs:30-70"]}
+{"query": "MAX_FILE_BYTES", "expect": ["src/ingest/walk.rs:11-11"]}
 {"query": "QUERY_PREFIX", "expect": ["src/embed/onnx.rs:1-40"]}
 {"query": "is_denied", "expect": ["src/ingest/deny.rs:160-235"]}
 {"query": "Pca::fit", "expect": ["src/tui/model.rs:150-216"]}
@@ -37,6 +37,6 @@
 {"query": "how does the mcp server pick up a reindex without restarting", "expect": ["src/mcp/mod.rs:22-75"]}
 {"query": "where are control characters removed from output", "expect": ["src/commands.rs:858-880"]}
 {"query": "SIMD int8 dot product with NEON and AVX2", "expect": ["src/index/kernel.rs"]}
-{"query": "reciprocal rank fusion of vector and keyword results", "expect": ["src/commands.rs:575-582", "src/commands.rs:700-716"]}
+{"query": "reciprocal rank fusion of vector and keyword results", "expect": ["src/commands.rs:661-676", "src/commands.rs:700-713"]}
 {"query": "fall back to keyword search when no embedding model is installed", "expect": ["src/commands.rs:578-596", "src/mcp/tools.rs:115-145", "src/tui/mod.rs:519-540"]}
 {"query": "drop the embedding model after idle minutes", "expect": ["src/mcp/mod.rs:12-16", "src/mcp/mod.rs:86-96", "src/tui/mod.rs:27-30"]}
