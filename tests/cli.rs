@@ -63,3 +63,50 @@ fn model_list_reports_missing_files_offline() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("missing"));
 }
+
+#[test]
+fn search_modes_without_a_model() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.rs"), "fn open_writer_lock() {}\n").unwrap();
+    std::fs::write(root.join("b.rs"), "fn unrelated() {}\n").unwrap();
+    pithdb::index_project(&root, &pithdb::embed::FakeEmbedder, false).unwrap();
+    for mode in [None, Some("hybrid"), Some("keyword")] {
+        let mut c = pith(&root);
+        c.args(["search", "WriterLock"]);
+        if let Some(m) = mode {
+            c.args(["--mode", m]);
+        }
+        let out = c.output().unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(out.status.success(), "{mode:?}: {stderr}");
+        assert!(
+            stdout.starts_with("1. 1.00  a.rs:1-1"),
+            "{mode:?}: {stdout}"
+        );
+        assert!(!stdout.contains("b.rs"), "{stdout}");
+        assert_eq!(
+            stderr.contains(pithdb::KEYWORD_ONLY),
+            mode != Some("keyword"),
+            "{mode:?}: {stderr}"
+        );
+    }
+    let out = pith(&root)
+        .args(["search", "x", "--mode", "vector"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pith model pull") || stderr.contains("onnx"),
+        "{stderr}"
+    );
+    let out = pith(&root)
+        .args(["search", "x", "--mode", "fuzzy"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}

@@ -683,7 +683,7 @@ mod tests {
         let db = d.db.as_ref().unwrap();
         s.hits =
             crate::search_project(dir, db, &FakeEmbedder, q, DEFAULT_K * MAX_PER_FILE).unwrap();
-        s.context = Some(crate::budget::context(&s.hits, None, 0, 0, DEFAULT_K));
+        s.context = Some(crate::budget::context(&s.hits, None, 0, 0, DEFAULT_K, None));
         s.hit_points = vec![Some([0.0, 0.0]); s.hits.len()];
         s
     }

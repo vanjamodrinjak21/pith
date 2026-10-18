@@ -33,14 +33,20 @@ pub(crate) struct Context {
 }
 
 /// Builds the `search_code` response for `hits` (ranked, over-fetched), keeping at most `k`.
+/// A `notice` (such as [`KEYWORD_ONLY`](crate::KEYWORD_ONLY)) becomes the second line.
 pub(crate) fn context(
     hits: &[SearchHit],
     git_head: Option<&str>,
     indexed_at: u64,
     now: u64,
     k: usize,
+    notice: Option<&str>,
 ) -> Context {
-    let header = staleness(git_head, indexed_at, now);
+    let mut header = staleness(git_head, indexed_at, now);
+    if let Some(n) = notice {
+        header.push_str(n);
+        header.push('\n');
+    }
     let budget = MAX_TOKENS.saturating_sub(tokens(header.chars().count()));
     let (mut kept, mut fates) =
         fit_budget_explained(hits.to_vec(), budget, MAX_PER_FILE, SNIPPET_LINES);
@@ -266,12 +272,18 @@ mod tests {
         );
         assert_eq!(kept.len(), 4);
         // `context` adds the k cut and renders what Claude receives.
-        let c = context(&hits, None, 0, 0, 2);
+        let c = context(&hits, None, 0, 0, 2, None);
         assert_eq!(c.fates[2], Fate::BeyondK);
         assert_eq!(c.fates[4], Fate::BeyondK);
         assert_eq!(c.tokens, tokens(c.text.chars().count()));
         assert!(c.text.starts_with("indexed 0 seconds ago\n") && c.tokens <= MAX_TOKENS);
         assert_eq!(c.text.matches("score 1.00").count(), 2);
+        let n = context(&hits, None, 0, 0, 2, Some("note"));
+        assert!(
+            n.text.starts_with("indexed 0 seconds ago\nnote\n\n"),
+            "{}",
+            n.text
+        );
     }
 
     #[test]
