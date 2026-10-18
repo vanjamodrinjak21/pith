@@ -110,3 +110,49 @@ fn search_modes_without_a_model() {
         .unwrap();
     assert!(!out.status.success());
 }
+
+#[test]
+fn eval_reports_every_mode_and_names_bad_lines() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.rs"), "fn open_writer_lock() {}\n").unwrap();
+    std::fs::write(root.join("b.rs"), "fn unrelated() {}\n").unwrap();
+    pithdb::index_project(&root, &pithdb::embed::FakeEmbedder, false).unwrap();
+    std::fs::write(
+        root.join("cases.jsonl"),
+        "{\"query\": \"WriterLock\", \"expect\": [\"a.rs:1-1\"]}\n\
+         {\"query\": \"nothing here\", \"expect\": [\"b.rs\"]}\n",
+    )
+    .unwrap();
+    let out = pith(&root)
+        .args(["eval", "cases.jsonl", "--mode", "keyword", "--verbose"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.starts_with("2 cases, k = 10\n"), "{stdout}");
+    assert!(
+        stdout.contains("keyword    0.50   0.50    0.50   0.50"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("miss [keyword] \"nothing here\": \n"),
+        "{stdout}"
+    );
+    // Without a model, vector mode is an error.
+    assert!(!pith(&root)
+        .args(["eval", "cases.jsonl"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    std::fs::write(root.join("bad.jsonl"), "\n{\"query\": 1}\n").unwrap();
+    let out = pith(&root).args(["eval", "bad.jsonl"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("line 2:"));
+}

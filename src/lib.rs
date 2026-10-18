@@ -3,11 +3,11 @@
 /// Longest chunk the chunker emits, in chars; the storage table bound derives from it.
 pub(crate) const CHUNK_MAX_CHARS: usize = 1_400;
 
-#[cfg(any(feature = "mcp", feature = "tui"))]
 mod budget;
 pub mod commands;
 pub mod embed;
 pub mod error;
+pub mod eval;
 pub mod index;
 pub mod ingest;
 #[cfg(feature = "mcp")]

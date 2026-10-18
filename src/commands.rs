@@ -497,7 +497,7 @@ pub fn open_project(start: &Path) -> Result<(PathBuf, Db)> {
 
 /// Resolves a stored relative path under `root`, refusing absolute paths, `..`, and any symlink
 /// along the way (the indexer never follows them). None means "do not touch the filesystem".
-fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
+pub(crate) fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     if rel.is_empty() || rel.contains('\0') || (cfg!(windows) && rel.contains('\\')) {
         return None;
     }

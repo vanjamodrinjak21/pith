@@ -7,7 +7,7 @@ description = "Pith: lightweight local vector database with built-in ONNX embedd
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vanjamodrinjak21/pith"
 readme = "README.md"
-exclude = [".superpowers/", ".claude/", ".remember/", ".madelog/", ".github/", "docs/", "PRD.md"]
+exclude = [".superpowers/", ".claude/", ".remember/", ".madelog/", ".github/", "docs/", "eval/", ".pithignore", "PRD.md"]
 keywords = ["vector-database", "embeddings", "onnx", "search"]
 categories = ["database-implementations"]
 

@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use pithdb::embed::{models_dir, pull, DEFAULT_MODEL};
+use pithdb::eval::{parse_cases, render_eval, run_eval};
 use pithdb::{
     index_project, is_yes, load_default_embedder, load_optional_embedder, open_project,
     render_error, render_search, render_stats, search_with, skip_summary, stats_project, Error,
@@ -40,6 +41,18 @@ enum Command {
         /// vector, keyword or hybrid (default; keyword-only when no model is installed)
         #[arg(long, default_value = "hybrid")]
         mode: SearchMode,
+    },
+    /// Measure retrieval quality on a JSONL file of cases (see eval/pith.jsonl)
+    Eval {
+        cases: PathBuf,
+        #[arg(short, default_value_t = 10)]
+        k: usize,
+        /// vector, keyword or hybrid (default: all three side by side)
+        #[arg(long)]
+        mode: Option<SearchMode>,
+        /// List the cases not found in the top k, with what was returned
+        #[arg(long)]
+        verbose: bool,
     },
     /// Show index statistics
     Stats,
@@ -180,6 +193,30 @@ fn run(cli: Cli) -> Result<()> {
                     pithdb::commands::unix_now()
                 )
             );
+            Ok(())
+        }
+        Command::Eval {
+            cases,
+            k,
+            mode,
+            verbose,
+        } => {
+            let cases = parse_cases(&std::fs::read_to_string(&cases)?)?;
+            let (root, db) = open_project(&std::env::current_dir()?)?;
+            let modes = mode.map_or(SearchMode::ALL.to_vec(), |m| vec![m]);
+            let embedder = if modes == [SearchMode::Keyword] {
+                None
+            } else {
+                load_optional_embedder()?
+            };
+            if embedder.is_none() && modes.contains(&SearchMode::Hybrid) {
+                eprintln!("pith: {KEYWORD_ONLY}");
+            }
+            let scores = modes
+                .into_iter()
+                .map(|m| run_eval(&root, &db, embedder.as_deref(), &cases, k, m))
+                .collect::<Result<Vec<_>>>()?;
+            print!("{}", render_eval(&scores, k, verbose));
             Ok(())
         }
         Command::Stats => {
