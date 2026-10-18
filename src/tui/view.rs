@@ -1,6 +1,6 @@
 //! Drawing. Every string that comes from the database passes through `clean`.
 
-use super::model::{bar, nearest, Tree};
+use super::model::{bar, Tree, COLOURS};
 use super::state::{Indexing, State, View};
 use super::Data;
 use crate::budget::{Fate, DEFAULT_K, MAX_PER_FILE, MAX_TOKENS, SNIPPET_LINES};
@@ -19,7 +19,7 @@ const PREVIEW_LINES: usize = 30;
 const PREVIEW_COLS: usize = 200;
 
 /// Map colours for the largest top-level entries; the rest are grey.
-const PALETTE: [Color; 8] = [
+const PALETTE: [Color; COLOURS] = [
     Color::Cyan,
     Color::Green,
     Color::Yellow,
@@ -219,6 +219,9 @@ fn map(f: &mut Frame, area: Rect, s: &State, d: &Data) {
     if d.pending.is_some() {
         return message(f, area, "projecting...");
     }
+    if d.map_failed {
+        return message(f, area, "map failed: the vectors could not be projected.");
+    }
     if m.points.is_empty() {
         return message(f, area, "Nothing to map: the index has no vectors.");
     }
@@ -227,10 +230,6 @@ fn map(f: &mut Frame, area: Rect, s: &State, d: &Data) {
     let [canvas, legend] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(left);
     let (xb, yb) = m.bounds();
-    let mut groups: Vec<Vec<(f64, f64)>> = vec![Vec::new(); PALETTE.len() + 1];
-    for (p, &g) in m.points.iter().zip(&d.groups) {
-        groups[(g as usize).min(PALETTE.len())].push((p[0] as f64, p[1] as f64));
-    }
     // Chunks retrieved in the RAG view: the ones sent to Claude, and the rest of the candidates.
     let (mut sent, mut dropped) = (Vec::new(), Vec::new());
     for (i, p) in s.hit_points.iter().enumerate() {
@@ -248,7 +247,7 @@ fn map(f: &mut Frame, area: Rect, s: &State, d: &Data) {
             .x_bounds(xb)
             .y_bounds(yb)
             .paint(|ctx| {
-                for (g, coords) in groups.iter().enumerate() {
+                for (g, coords) in d.groups.iter().enumerate() {
                     let color = group_color(Some(g));
                     ctx.draw(&Points { coords, color });
                 }
@@ -287,7 +286,7 @@ fn map(f: &mut Frame, area: Rect, s: &State, d: &Data) {
     );
     shade_density(f, canvas, &m.points, (xb, yb));
     f.render_widget(Paragraph::new(legend_line(&d.tree)), legend);
-    let chunk = nearest(&m.points, s.cursor).and_then(|i| d.chunk(m.id(i)));
+    let chunk = s.near.and_then(|i| d.chunk(m.id(i)));
     preview_pane(f, right, chunk, "");
 }
 
@@ -757,6 +756,16 @@ mod tests {
             .filter(|c| matches!(c.bg, Color::Indexed(_)))
             .count();
         assert!(shaded > 0);
+    }
+
+    #[test]
+    fn map_failure_is_shown() {
+        let (_d, mut d) = sample();
+        d.map_failed = true;
+        d.map = Default::default();
+        let mut s = State::new(&d.tree, &d.map);
+        s.view = View::Map;
+        assert!(render(&s, &d, 80, 10).contains("map failed"));
     }
 
     #[test]

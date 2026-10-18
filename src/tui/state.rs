@@ -1,6 +1,6 @@
 //! UI state and the key reducer. No terminal and no I/O: side effects are returned as [`Action`]s.
 
-use super::model::{grow, padded, Map, Tree};
+use super::model::{grow, nearest, padded, Map, Tree};
 use crate::budget::Context;
 use crate::SearchHit;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -116,8 +116,9 @@ pub(crate) struct State {
     /// Keys move the chunk list of the selected file instead of the tree.
     pub in_chunks: bool,
     pub chunk: usize,
-    /// Map cursor in plane coordinates.
+    /// Map cursor in plane coordinates, and the map point nearest to it (updated on moves).
     pub cursor: [f32; 2],
+    pub near: Option<usize>,
     pub editing: bool,
     pub query: String,
     /// Ranked candidates (over-fetched like `search_code`) and what the budget made of them.
@@ -137,6 +138,7 @@ pub(crate) struct State {
 impl State {
     pub fn new(tree: &Tree, map: &Map) -> State {
         let ([x0, x1], [y0, y1]) = map.bounds();
+        let cursor = [((x0 + x1) / 2.0) as f32, ((y0 + y1) / 2.0) as f32];
         State {
             view: View::Stack,
             help: false,
@@ -144,7 +146,8 @@ impl State {
             row: 0,
             in_chunks: false,
             chunk: 0,
-            cursor: [((x0 + x1) / 2.0) as f32, ((y0 + y1) / 2.0) as f32],
+            cursor,
+            near: nearest(&map.points, cursor),
             editing: false,
             query: String::new(),
             hits: Vec::new(),
@@ -307,6 +310,7 @@ impl State {
         }
         c[0] = c[0].clamp(x0 as f32, x1 as f32);
         c[1] = c[1].clamp(y0 as f32, y1 as f32);
+        self.near = nearest(&map.points, self.cursor);
     }
 
     fn search(&mut self, code: KeyCode) {
@@ -458,6 +462,8 @@ pub(crate) mod tests {
         press(&mut s, &[KeyCode::Char('j'); 100], &t, &m);
         let ([x0, _], [y0, _]) = m.bounds();
         assert_eq!(s.cursor, [x0 as f32, y0 as f32]);
+        assert_eq!(s.near, nearest(&m.points, s.cursor), "cached on every move");
+        assert!(s.near.is_some());
     }
 
     #[test]

@@ -227,8 +227,10 @@ pub fn index_project(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Res
 }
 
 /// [`index_project`] without any output and without the `.gitignore` update. `progress` is
-/// called once after the walk and after every embedded group; returning false cancels with
-/// `Error::Cancelled` before anything is written, so the previous index stays as it was.
+/// called once after the walk, after every embedded group, and once more (with no new vectors)
+/// just before the new database replaces the old one. Returning false cancels with
+/// `Error::Cancelled`: the temp file is removed and the previous index stays as it was. The
+/// walk and the group being embedded are not interrupted; a cancel takes effect at the next call.
 pub fn index_project_with_progress(
     root: &Path,
     embedder: &dyn Embedder,
@@ -247,7 +249,11 @@ pub fn index_project_with_progress(
 /// Best-effort `.gitignore` update; returns the warning text on failure.
 pub(crate) fn gitignore_warning(root: &Path) -> Option<String> {
     // `.pith` is listed only once it exists; a failed first run leaves just the lock file.
-    let with_db = root.join(DB_NAME).symlink_metadata().is_ok();
+    gitignore_warning_for(root, root.join(DB_NAME).symlink_metadata().is_ok())
+}
+
+/// [`gitignore_warning`], listing `.pith` only when `with_db` (a cancelled run lists just the lock).
+pub(crate) fn gitignore_warning_for(root: &Path, with_db: bool) -> Option<String> {
     update_gitignore(root, with_db).err().map(|e| {
         format!(
             "pith: warning: could not update .gitignore: {}",
@@ -337,6 +343,7 @@ fn index_inner(
             got: index.dim(),
         });
     }
+    let last = chunks.last().map(|c| c.path.clone()).unwrap_or_default();
     let stored = chunks
         .into_iter()
         .map(|c| StoredChunk {
@@ -350,7 +357,29 @@ fn index_inner(
         indexed_at_unix,
         git_head: git_head(root),
     };
-    Db::write(&db_path, embedder.model_id(), stored, &index, meta)?;
+    // Last chance to cancel: after this the rename is the only step left.
+    let last_check = || {
+        let p = Progress {
+            files_done: files,
+            chunks_done: total,
+            current: &last,
+            vectors: &[],
+            ..base
+        };
+        if progress(&p) {
+            Ok(())
+        } else {
+            Err(Error::Cancelled)
+        }
+    };
+    Db::write_checked(
+        &db_path,
+        embedder.model_id(),
+        stored,
+        &index,
+        meta,
+        last_check,
+    )?;
     Ok(IndexReport {
         chunks: total,
         files,
@@ -644,13 +673,42 @@ mod tests {
             .unwrap();
         assert!(seen.len() > 2, "{seen:?}");
         assert!(
-            seen.windows(2).all(|w| w[0].2 <= w[1].2 && w[0].3 < w[1].3),
+            seen.windows(2)
+                .all(|w| w[0].2 <= w[1].2 && w[0].3 <= w[1].3),
             "{seen:?}"
         );
         assert!(seen.iter().all(|s| (s.0, s.1) == (r.files, r.chunks)));
         assert_eq!(seen.iter().map(|s| s.4).sum::<usize>(), r.chunks);
         let last = seen.last().unwrap();
         assert_eq!((last.2, last.3), (r.files, r.chunks));
+    }
+
+    #[test]
+    fn cancel_just_before_the_rename_writes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "one\n").unwrap();
+        index_project(d.path(), &crate::embed::FakeEmbedder, false).unwrap();
+        let before = std::fs::read(d.path().join(DB_NAME)).unwrap();
+        std::fs::write(d.path().join("b.txt"), "two\n").unwrap();
+        let mut last = false;
+        let r =
+            index_project_with_progress(d.path(), &crate::embed::FakeEmbedder, false, &mut |p| {
+                // The final call: everything embedded, nothing new, the temp file already synced.
+                last = p.chunks_done == p.chunks && p.vectors.is_empty() && p.chunks > 0;
+                !last
+            });
+        assert!(last && matches!(r, Err(Error::Cancelled)), "{r:?}");
+        assert_eq!(std::fs::read(d.path().join(DB_NAME)).unwrap(), before);
+        let mut names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [".pith", ".pith.lock", "a.txt", "b.txt"],
+            "temp file removed"
+        );
     }
 
     #[test]

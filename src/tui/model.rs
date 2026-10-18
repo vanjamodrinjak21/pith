@@ -3,6 +3,9 @@
 
 use std::collections::HashMap;
 
+/// Map colour groups: the largest top-level entries; the rest share one "other" colour.
+pub(crate) const COLOURS: usize = 8;
+
 /// At most this many vectors are projected onto the map, evenly strided.
 pub(crate) const MAP_CAP: usize = 20_000;
 

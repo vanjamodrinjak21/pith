@@ -10,14 +10,14 @@ mod view;
 
 use crate::budget::{context, DEFAULT_K, MAX_PER_FILE};
 use crate::commands::{
-    clean, gitignore_warning, index_project_with_progress, open_project, render_error,
-    search_project, unix_now,
+    clean, gitignore_warning, gitignore_warning_for, index_project_with_progress, open_project,
+    render_error, search_project, unix_now,
 };
 use crate::embed::Embedder;
 use crate::storage::{Db, StoredChunk};
 use crate::{Error, Result};
 use crossterm::event::{self, Event, KeyEventKind};
-use model::{sample_ids, Map, Pca, Tree, MAP_CAP};
+use model::{sample_ids, Map, Pca, Tree, COLOURS, MAP_CAP};
 use state::{Action, Delta, Indexing, State, View};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -35,9 +35,12 @@ pub(crate) struct Data {
     tree: Tree,
     /// Empty until the projection thread delivers it (`pending`).
     map: Map,
-    /// Colour group of each map point (index into the view palette; larger = "other").
-    groups: Vec<u8>,
+    /// Map points bucketed by colour group (top-level entries, then one "other" bucket), built
+    /// once when the map arrives instead of every frame.
+    groups: Vec<Vec<(f64, f64)>>,
     pending: Option<mpsc::Receiver<Map>>,
+    /// The projection thread died without a map.
+    map_failed: bool,
 }
 
 impl Data {
@@ -67,6 +70,7 @@ impl Data {
             map: Map::default(),
             groups: Vec::new(),
             pending: Some(rx),
+            map_failed: false,
         })
     }
 
@@ -79,6 +83,7 @@ impl Data {
             map: Map::default(),
             groups: Vec::new(),
             pending: None,
+            map_failed: false,
         }
     }
 
@@ -87,25 +92,29 @@ impl Data {
         let Some(rx) = &self.pending else {
             return false;
         };
-        let m = if wait {
-            rx.recv().ok()
+        let r = if wait {
+            rx.recv().map_err(|_| mpsc::TryRecvError::Disconnected)
         } else {
-            rx.try_recv().ok()
+            rx.try_recv()
         };
-        let gone = matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
-        let Some(map) = m else {
-            if gone {
-                self.pending = None; // the thread died: keep the empty map
+        let map = match r {
+            Ok(m) => m,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending = None;
+                self.map_failed = true;
+                return true;
             }
-            return false;
         };
-        self.groups = (0..map.points.len())
-            .map(|i| {
-                self.chunk(map.id(i))
-                    .and_then(|c| self.tree.group(&c.path))
-                    .map_or(u8::MAX, |g| g.min(u8::MAX as usize) as u8)
-            })
-            .collect();
+        let mut groups = vec![Vec::new(); COLOURS + 1];
+        for (i, p) in map.points.iter().enumerate() {
+            let g = self
+                .chunk(map.id(i))
+                .and_then(|c| self.tree.group(&c.path))
+                .map_or(COLOURS, |g| g.min(COLOURS));
+            groups[g].push((p[0] as f64, p[1] as f64));
+        }
+        self.groups = groups;
         self.map = map;
         self.pending = None;
         true
@@ -154,10 +163,18 @@ enum Msg {
 }
 
 /// A running index worker: one thread, cancelled through the flag, reporting over the channel.
-/// Dropping it detaches the thread, which stops at its next progress check (see `detach`).
+/// Dropping it sets the flag and detaches the thread (see `detach`).
 struct Worker {
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<Msg>,
+    #[cfg_attr(not(test), allow(dead_code))] // only tests join it; the UI never waits
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Sends the run's result exactly once; if the worker unwinds from a panic, Drop reports it.
@@ -240,9 +257,9 @@ fn index_run(
         // Checked again here: a cancel during this group's embedding stops before the next.
         !stop.load(Ordering::Relaxed)
     });
-    // A cancelled run touches nothing, not even .gitignore.
+    // A cancelled run leaves .pith alone and lists only the lock file it may have created.
     let warning = match &r {
-        Err(Error::Cancelled) => None,
+        Err(Error::Cancelled) => gitignore_warning_for(root, false),
         _ => gitignore_warning(root),
     };
     let r = r?;
@@ -266,7 +283,7 @@ impl Worker {
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let stop = cancel.clone();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name(WORKER.into())
             .spawn(move || {
                 let mut rep = Reporter {
@@ -276,14 +293,20 @@ impl Worker {
                 let r = index_run(&root, basis, &stop, &tx, load);
                 rep.done(r.map_err(|e| message(&e)));
             })?;
-        Ok(Worker { cancel, rx })
+        Ok(Worker {
+            cancel,
+            rx,
+            thread: Some(thread),
+        })
     }
 
-    /// Cancels without waiting. The worker checks the flag before and after every embedded
-    /// group and the database is written only after the last check passes, so a cancelled run
-    /// never writes; a write already under way is atomic (temp file + rename) either way.
+    /// Cancels without waiting (quit). The worker sees the flag at its next progress call: after
+    /// the group it is embedding (or the walk), or at the final check just before the rename,
+    /// so a cancelled run never replaces `.pith` and its temp file is removed. Only a quit
+    /// that lands after that final check lets the (atomic) rename finish, or the process exit
+    /// interrupts it before the rename, leaving the old file.
     fn detach(self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        drop(self);
     }
 }
 
@@ -324,7 +347,7 @@ fn drain(worker: &mut Option<Worker>, state: &mut State, data: &mut Data) -> boo
                 }
             }
             Msg::Done(r) => {
-                *worker = None;
+                *worker = None; // finished: dropping only sets an unused flag
                 if let Some(i) = state.indexing.as_mut() {
                     i.finish();
                 }
@@ -350,11 +373,33 @@ fn reset(state: &mut State, data: &Data) {
     (state.view, state.indexing) = (view, indexing);
 }
 
+type Hook = Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send>;
+
+/// Puts back the panic hook that was installed before `pith ui` started, when dropped.
+struct HookGuard(Option<Hook>);
+
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0.take() {
+            std::panic::set_hook(Box::new(move |info| prev(info)));
+        }
+    }
+}
+
+/// Takes the current hook out (so ratatui's init chains to it) and returns a guard that
+/// reinstalls it.
+fn save_panic_hook() -> HookGuard {
+    let prev: Hook = Arc::from(std::panic::take_hook());
+    let chained = prev.clone();
+    std::panic::set_hook(Box::new(move |info| chained(info)));
+    HookGuard(Some(prev))
+}
+
 /// Restores the terminal on panics of the UI thread. A worker panic only records its message
 /// (its Reporter then shows it in the status line) and a map-thread panic leaves the map empty,
-/// so neither writes over the screen.
+/// so neither writes over the screen. Wraps the hook current at the call (ratatui's).
 fn install_panic_hook() {
-    let ratatui_hook = std::panic::take_hook(); // set by try_init: restores, then reports
+    let outer = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let name = std::thread::current().name().map(str::to_owned);
         if name.as_deref() == Some(MAP_THREAD) {
@@ -369,7 +414,7 @@ fn install_panic_hook() {
             *WORKER_PANIC.lock().unwrap_or_else(|e| e.into_inner()) = msg;
             return;
         }
-        ratatui_hook(info)
+        outer(info)
     }));
 }
 
@@ -388,7 +433,9 @@ pub fn run(project: Option<PathBuf>, index: bool) -> Result<()> {
         r => r?,
     };
     let mut state = State::new(&data.tree, &data.map);
-    // Before init, so a half-done init is undone too (restore is idempotent).
+    // Before init, so a half-done init is undone too (restore is idempotent). Dropped in
+    // reverse order on return: the terminal is restored, then the original panic hook.
+    let _hook = save_panic_hook();
     let _restore = Restore;
     let mut terminal = ratatui::try_init()?;
     install_panic_hook();
@@ -409,7 +456,10 @@ pub fn run(project: Option<PathBuf>, index: bool) -> Result<()> {
         }
         dirty |= drain(&mut worker, &mut state, &mut data);
         if data.poll_map(false) {
-            state.cursor = State::new(&data.tree, &data.map).cursor;
+            (state.cursor, state.near) = {
+                let fresh = State::new(&data.tree, &data.map);
+                (fresh.cursor, fresh.near)
+            };
             dirty = true;
         }
         let action = match pending.take() {
@@ -477,6 +527,7 @@ fn search_lazy(
     s: &mut State,
     q: &str,
 ) -> Result<&'static str> {
+    clear_results(s); // also when loading the model fails
     if embedder.is_none() {
         *embedder = Some((crate::load_default_embedder()?, Instant::now()));
     }
@@ -487,9 +538,13 @@ fn search_lazy(
 
 /// Runs `q` the way `search_code` does and returns a status message; projects the query and
 /// the candidates onto the map. On error the previous results are already cleared.
-fn search(e: &dyn Embedder, d: &Data, s: &mut State, q: &str) -> Result<&'static str> {
+fn clear_results(s: &mut State) {
     (s.hits, s.context, s.hit_points, s.query_point) = (Vec::new(), None, Vec::new(), None);
     (s.hit, s.scroll) = (0, 0);
+}
+
+fn search(e: &dyn Embedder, d: &Data, s: &mut State, q: &str) -> Result<&'static str> {
+    clear_results(s);
     let db =
         d.db.as_ref()
             .ok_or_else(|| Error::NoIndex(d.root.display().to_string()))?;
@@ -613,12 +668,18 @@ mod tests {
             ix.chunks,
             "map recomputed from the new index"
         );
-        assert_eq!(d.groups.len(), d.map.points.len());
+        assert_eq!(
+            d.groups.iter().map(Vec::len).sum::<usize>(),
+            d.map.points.len()
+        );
         assert_eq!(s.view, View::Index, "view kept across the reload");
     }
 
     #[test]
     fn worker_panic_is_reported_and_indexing_works_again() {
+        // The real hooks, as `run` installs them (restored when `_hook` drops).
+        let _hook = save_panic_hook();
+        install_panic_hook();
         let dir = project(1);
         let mut d = Data::empty(dir.path().to_path_buf());
         let mut s = State::new(&d.tree, &d.map);
@@ -627,7 +688,8 @@ mod tests {
         finish(&mut w, &mut s, &mut d);
         assert!(!s.indexing.as_ref().unwrap().running);
         assert!(
-            s.status.contains("indexing failed (internal error"),
+            s.status
+                .contains("indexing failed (internal error: boom in the worker)"),
             "{}",
             s.status
         );
@@ -650,6 +712,7 @@ mod tests {
         let mut w = Some(Worker {
             cancel: Arc::default(),
             rx,
+            thread: None,
         });
         assert!(drain(&mut w, &mut s, &mut d));
         assert!(w.is_none() && !s.indexing.as_ref().unwrap().running);
@@ -663,7 +726,21 @@ mod tests {
         std::fs::write(dir.path().join("new.rs"), "fn new() {}\n").unwrap();
         let db = dir.path().join(".pith");
         let before = std::fs::read(&db).unwrap();
-        let gitignore_absent = !dir.path().join(".gitignore").exists();
+        // Lists the lock but not .pith: a cancelled run must not add .pith.
+        let ignore = dir.path().join(".gitignore");
+        std::fs::write(&ignore, "target/\n.pith.lock\n").unwrap();
+        let unchanged = || {
+            assert_eq!(std::fs::read(&db).unwrap(), before);
+            assert_eq!(
+                std::fs::read_to_string(&ignore).unwrap(),
+                "target/\n.pith.lock\n"
+            );
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                10 + 1 + 3,
+                "no temp file"
+            );
+        };
         let mut d = Data::load(dir.path()).unwrap();
         d.poll_map(true);
         let mut s = State::new(&d.tree, &d.map);
@@ -674,20 +751,62 @@ mod tests {
         w.as_ref().unwrap().cancel.store(true, Ordering::Relaxed);
         finish(&mut w, &mut s, &mut d);
         assert!(s.status.contains("cancelled"), "{}", s.status);
-        // Quit: detach without waiting; the worker stops on its own and never writes.
+        unchanged();
+        // Quit: detach returns at once; the thread then ends by itself without writing.
         start_index(&mut w, &mut s, &d, slow);
         std::thread::sleep(Duration::from_millis(80));
+        let mut worker = w.take().unwrap();
+        let thread = worker.thread.take().unwrap();
         let t = Instant::now();
-        w.take().unwrap().detach();
+        worker.detach();
         assert!(
             t.elapsed() < Duration::from_millis(20),
             "quit must not block"
         );
-        std::thread::sleep(Duration::from_millis(900));
-        assert_eq!(std::fs::read(&db).unwrap(), before);
-        assert_eq!(!dir.path().join(".gitignore").exists(), gitignore_absent);
-        let names = std::fs::read_dir(dir.path()).unwrap().count();
-        assert_eq!(names, 10 + 1 + 2, "no temp file left");
+        thread.join().unwrap(); // the done signal: the worker has exited
+        unchanged();
+    }
+
+    #[test]
+    fn a_cancelled_first_run_lists_only_the_lock() {
+        let dir = project(1);
+        let ignore = dir.path().join(".gitignore");
+        std::fs::write(&ignore, "target/\n").unwrap();
+        let mut d = Data::empty(dir.path().to_path_buf());
+        let mut s = State::new(&d.tree, &d.map);
+        let mut w = None;
+        start_index(&mut w, &mut s, &d, slow);
+        w.as_ref().unwrap().cancel.store(true, Ordering::Relaxed);
+        finish(&mut w, &mut s, &mut d);
+        assert!(s.status.contains("cancelled"), "{}", s.status);
+        assert!(!dir.path().join(".pith").exists());
+        assert_eq!(
+            std::fs::read_to_string(&ignore).unwrap(),
+            "target/\n.pith.lock\n"
+        );
+    }
+
+    #[test]
+    fn poll_map_delivers_once_and_reports_a_dead_thread() {
+        let dir = project(2);
+        crate::index_project(dir.path(), &FakeEmbedder, false).unwrap();
+        let mut d = Data::load(dir.path()).unwrap();
+        let t = Instant::now();
+        while !d.poll_map(false) {
+            assert!(t.elapsed() < Duration::from_secs(10));
+        }
+        assert!(!d.map.points.is_empty() && !d.map_failed && d.pending.is_none());
+        assert!(!d.poll_map(false), "nothing more to take");
+        // A sender dropped without a map: failed, not "nothing to map".
+        let (tx, rx) = mpsc::channel::<Map>();
+        drop(tx);
+        d.pending = Some(rx);
+        assert!(d.poll_map(false) && d.map_failed && d.pending.is_none());
+        // Still waiting: no change.
+        let (_tx, rx) = mpsc::channel::<Map>();
+        d.pending = Some(rx);
+        d.map_failed = false;
+        assert!(!d.poll_map(false) && d.pending.is_some());
     }
 
     #[test]
