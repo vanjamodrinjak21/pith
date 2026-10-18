@@ -1,9 +1,10 @@
 //! UI state and the key reducer. No terminal and no I/O: side effects are returned as [`Action`]s.
 
-use super::model::{Map, Tree};
+use super::model::{grow, padded, Map, Tree};
 use crate::budget::Context;
 use crate::SearchHit;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Longest query accepted on the query line, in chars.
@@ -40,13 +41,44 @@ pub(crate) struct Indexing {
     pub files_done: usize,
     pub chunks_done: usize,
     pub current: String,
-    /// (path, reason), already scrubbed.
-    pub skipped: Vec<(String, String)>,
-    /// Sampled embedded chunks projected onto the plane so far.
-    pub points: Vec<[f32; 2]>,
+    /// (path, reason), already scrubbed; shared with the worker, sent once.
+    pub skipped: Arc<Vec<(String, String)>>,
+    /// Sampled embedded chunks projected onto the plane so far, and their raw extent.
+    pub points: Vec<(f64, f64)>,
+    pub extent: Option<[[f64; 2]; 2]>,
+}
+
+/// One progress report from the indexing worker: counters plus only the new points.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Delta {
+    pub files: usize,
+    pub chunks: usize,
+    pub files_done: usize,
+    pub chunks_done: usize,
+    pub current: String,
+    pub points: Vec<(f64, f64)>,
+    /// Set when the skipped list changed (normally once, after the walk).
+    pub skipped: Option<Arc<Vec<(String, String)>>>,
 }
 
 impl Indexing {
+    pub fn apply(&mut self, d: Delta) {
+        (self.files, self.chunks) = (d.files, d.chunks);
+        (self.files_done, self.chunks_done) = (d.files_done, d.chunks_done);
+        self.current = d.current;
+        for &(x, y) in &d.points {
+            grow(&mut self.extent, [x, y]);
+        }
+        self.points.extend(d.points);
+        if let Some(s) = d.skipped {
+            self.skipped = s;
+        }
+    }
+
+    pub fn bounds(&self) -> ([f64; 2], [f64; 2]) {
+        padded(self.extent)
+    }
+
     pub fn finish(&mut self) {
         self.running = false;
         self.ended = Some(Instant::now());
@@ -67,8 +99,9 @@ impl Indexing {
             files_done: 0,
             chunks_done: 0,
             current: String::new(),
-            skipped: Vec::new(),
+            skipped: Arc::default(),
             points: Vec::new(),
+            extent: None,
         }
     }
 }
@@ -138,6 +171,11 @@ impl State {
     }
 
     pub fn update(&mut self, key: KeyEvent, tree: &Tree, map: &Map) -> Action {
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl_c {
+            return Action::Quit;
+        }
         if self.help {
             self.help = false;
             return Action::None;
@@ -340,6 +378,11 @@ pub(crate) mod tests {
         assert!(s.help);
         assert_eq!(s.update(key(KeyCode::Char('q')), &t, &m), Action::None);
         assert!(!s.help);
+        // ...but Ctrl-C always quits, even over help or the query line.
+        press(&mut s, &[KeyCode::Char('?')], &t, &m);
+        assert_eq!(s.update(ctrl_c, &t, &m), Action::Quit);
+        press(&mut s, &[KeyCode::Esc, KeyCode::Char('/')], &t, &m);
+        assert_eq!(s.update(ctrl_c, &t, &m), Action::Quit);
     }
 
     #[test]

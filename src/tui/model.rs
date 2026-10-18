@@ -242,6 +242,8 @@ pub(crate) struct Map {
     pub pca: Option<Pca>,
     pub points: Vec<[f32; 2]>,
     n: usize,
+    /// Raw extent of `points`, computed once.
+    extent: Option<[[f64; 2]; 2]>,
 }
 
 impl Map {
@@ -251,15 +253,26 @@ impl Map {
         let Some(pca) = Pca::fit(q, dim, &ids) else {
             return Map::default();
         };
-        let points = ids
+        let points: Vec<[f32; 2]> = ids
             .iter()
             .filter_map(|&i| pca.project_row(&q[i * dim..(i + 1) * dim]))
             .collect();
+        let mut extent = None;
+        for p in &points {
+            grow(&mut extent, [p[0] as f64, p[1] as f64]);
+        }
         Map {
             pca: Some(pca),
             points,
             n,
+            extent,
         }
+    }
+
+    /// For a map built from an already-strided sample: point ids then refer to `n` chunks.
+    pub fn with_total(mut self, n: usize) -> Map {
+        self.n = n;
+        self
     }
 
     /// Chunk id of point `i`.
@@ -269,23 +282,28 @@ impl Map {
 
     /// (min, max) over x and y, padded so a single point or a line still has an area.
     pub fn bounds(&self) -> ([f64; 2], [f64; 2]) {
-        let mut b = [[f64::MAX, f64::MIN]; 2];
-        for p in &self.points {
-            for k in 0..2 {
-                b[k][0] = b[k][0].min(p[k] as f64);
-                b[k][1] = b[k][1].max(p[k] as f64);
-            }
-        }
-        b.map(|[lo, hi]| {
-            if lo > hi {
-                [-1.0, 1.0]
-            } else {
-                let pad = ((hi - lo) * 0.05).max(1e-3);
-                [lo - pad, hi + pad]
-            }
-        })
-        .into()
+        padded(self.extent)
     }
+}
+
+/// Grows the raw `[[x0, x1], [y0, y1]]` extent of a point set by `p`.
+pub(crate) fn grow(extent: &mut Option<[[f64; 2]; 2]>, p: [f64; 2]) {
+    let e = extent.get_or_insert([[p[0], p[0]], [p[1], p[1]]]);
+    for k in 0..2 {
+        e[k] = [e[k][0].min(p[k]), e[k][1].max(p[k])];
+    }
+}
+
+/// An extent padded by 5% (at least 1e-3); no points gives [-1, 1] on both axes.
+pub(crate) fn padded(extent: Option<[[f64; 2]; 2]>) -> ([f64; 2], [f64; 2]) {
+    let b = extent.unwrap_or([[-1.0, 1.0]; 2]).map(|[lo, hi]| {
+        if extent.is_none() {
+            return [lo, hi];
+        }
+        let pad = ((hi - lo) * 0.05).max(1e-3);
+        [lo - pad, hi + pad]
+    });
+    (b[0], b[1])
 }
 
 /// Index of the point nearest to `p` (first on ties).
@@ -470,6 +488,13 @@ mod tests {
         assert_eq!(m.points.len(), 7);
         let ids: Vec<u32> = (0..7).map(|i| m.id(i)).collect();
         assert_eq!(ids, sample_ids(n, 7).map(|i| i as u32).collect::<Vec<_>>());
+        // Built from the pre-sampled rows, the ids and points are the same.
+        let rows: Vec<i8> = sample_ids(n, 7)
+            .flat_map(|i| q[i * 3..i * 3 + 3].to_vec())
+            .collect();
+        let s = Map::build(&rows, 3, 7, 7).with_total(n);
+        assert_eq!((0..7).map(|i| s.id(i)).collect::<Vec<_>>(), ids);
+        assert_eq!(s.points, m.points);
         let ([x0, x1], _) = m.bounds();
         assert!(m.points.iter().all(|p| (x0..=x1).contains(&(p[0] as f64))));
         assert_eq!(nearest(&[], [0.0, 0.0]), None);

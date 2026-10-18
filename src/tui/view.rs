@@ -194,7 +194,7 @@ fn stack(f: &mut Frame, area: Rect, s: &State, d: &Data) {
         &mut ListState::default().with_selected(Some(s.row)),
     );
     let chunks = s.file_chunks(t);
-    let list_h = (chunks.len() as u16 + 2).min(right.height / 3).max(3);
+    let list_h = (chunks.len() + 2).min(right.height as usize / 3).max(3) as u16;
     let [list, prev] =
         Layout::vertical([Constraint::Length(list_h), Constraint::Min(0)]).areas(right);
     let items: Vec<ListItem> = chunks
@@ -216,6 +216,9 @@ fn stack(f: &mut Frame, area: Rect, s: &State, d: &Data) {
 
 fn map(f: &mut Frame, area: Rect, s: &State, d: &Data) {
     let m = &d.map;
+    if d.pending.is_some() {
+        return message(f, area, "projecting...");
+    }
     if m.points.is_empty() {
         return message(f, area, "Nothing to map: the index has no vectors.");
     }
@@ -225,13 +228,8 @@ fn map(f: &mut Frame, area: Rect, s: &State, d: &Data) {
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(left);
     let (xb, yb) = m.bounds();
     let mut groups: Vec<Vec<(f64, f64)>> = vec![Vec::new(); PALETTE.len() + 1];
-    for (i, p) in m.points.iter().enumerate() {
-        let g = d
-            .chunk(m.id(i))
-            .and_then(|c| d.tree.group(&c.path))
-            .filter(|&g| g < PALETTE.len())
-            .unwrap_or(PALETTE.len());
-        groups[g].push((p[0] as f64, p[1] as f64));
+    for (p, &g) in m.points.iter().zip(&d.groups) {
+        groups[(g as usize).min(PALETTE.len())].push((p[0] as f64, p[1] as f64));
     }
     // Chunks retrieved in the RAG view: the ones sent to Claude, and the rest of the candidates.
     let (mut sent, mut dropped) = (Vec::new(), Vec::new());
@@ -463,7 +461,7 @@ fn rag(f: &mut Frame, area: Rect, s: &State, d: &Data) {
             .iter()
             .map(|(p, n)| Line::raw(format!("{n}/{MAX_PER_FILE}  {}", clean(p)))),
     );
-    let meter_h = (lines.len() as u16 + 2).min(side.height / 2);
+    let meter_h = (lines.len() + 2).min(side.height as usize / 2) as u16;
     let [meter, prev] =
         Layout::vertical([Constraint::Length(meter_h), Constraint::Min(0)]).areas(side);
     f.render_widget(
@@ -489,32 +487,23 @@ fn index(f: &mut Frame, area: Rect, s: &State) {
             .block(Block::bordered().title(" Indexing ")),
         left,
     );
-    let pts: Vec<(f64, f64)> = ix
-        .points
-        .iter()
-        .map(|p| (p[0] as f64, p[1] as f64))
-        .collect();
-    let (xb, yb) = bounds(&ix.points);
+    let (xb, yb) = ix.bounds();
     f.render_widget(
         Canvas::default()
-            .block(Block::bordered().title(format!(" Embedded chunks ({} sampled) ", pts.len())))
+            .block(
+                Block::bordered().title(format!(" Embedded chunks ({} sampled) ", ix.points.len())),
+            )
             .marker(Marker::Braille)
             .x_bounds(xb)
             .y_bounds(yb)
             .paint(|ctx| {
                 ctx.draw(&Points {
-                    coords: &pts,
+                    coords: &ix.points,
                     color: Color::Cyan,
                 })
             }),
         right,
     );
-}
-
-fn bounds(points: &[[f32; 2]]) -> ([f64; 2], [f64; 2]) {
-    let mut m = super::model::Map::default();
-    m.points = points.to_vec();
-    m.bounds()
 }
 
 fn index_lines(ix: &Indexing, width: usize) -> Vec<Line<'static>> {
@@ -612,7 +601,8 @@ mod tests {
             std::fs::write(p, text).unwrap();
         }
         crate::index_project(dir.path(), &FakeEmbedder, false).unwrap();
-        let d = Data::load(dir.path()).unwrap();
+        let mut d = Data::load(dir.path()).unwrap();
+        d.poll_map(true);
         (dir, d)
     }
 
@@ -731,10 +721,19 @@ mod tests {
         s.view = View::Index;
         assert!(render(&s, &d, 100, 20).contains("Press i"));
         let mut ix = crate::tui::state::Indexing::new(std::time::Instant::now());
-        (ix.files, ix.chunks, ix.files_done, ix.chunks_done) = (3, 40, 1, 20);
-        ix.current = "src/big.rs".into();
-        ix.skipped = vec![("key.pem".into(), "Denied".into())];
-        ix.points = vec![[0.0, 0.0], [1.0, 2.0]];
+        ix.apply(crate::tui::state::Delta {
+            files: 3,
+            chunks: 40,
+            files_done: 1,
+            chunks_done: 20,
+            current: "src/big.rs".into(),
+            points: vec![(0.0, 0.0), (1.0, 2.0)],
+            skipped: Some(std::sync::Arc::new(vec![(
+                "key.pem".into(),
+                "Denied".into(),
+            )])),
+        });
+        assert_eq!(ix.bounds(), ([-0.05, 1.05], [-0.1, 2.1]));
         s.indexing = Some(ix);
         let out = render(&s, &d, 100, 20);
         for want in [
