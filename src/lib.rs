@@ -17,8 +17,9 @@ pub mod storage;
 pub mod tui;
 
 pub use commands::{
-    index_project, index_project_with_progress, is_yes, load_default_embedder, open_project,
-    render_error, render_search, render_stats, search_project, skip_summary, stats_project,
-    IndexReport, Progress, SearchHit, Stats,
+    index_project, index_project_with_progress, is_no_model, is_yes, load_default_embedder,
+    load_optional_embedder, open_project, render_error, render_search, render_stats,
+    search_project, search_with, skip_summary, stats_project, IndexReport, Progress, SearchHit,
+    SearchMode, Stats, KEYWORD_ONLY,
 };
 pub use error::{Error, Result};
