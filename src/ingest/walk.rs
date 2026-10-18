@@ -298,7 +298,9 @@ fn read_text(
     Ok(text)
 }
 
-/// `-----BEGIN ... PRIVATE KEY-----` on one line (RSA, EC, OPENSSH, ENCRYPTED, plain).
+/// A PEM private-key header on one line: five dashes, BEGIN, then `PRIVATE KEY` and five dashes
+/// later on the same line (RSA, EC, OPENSSH, ENCRYPTED, plain). Unanchored on purpose: JSON
+/// service-account files carry the header mid-line.
 fn has_private_key_header(text: &str) -> bool {
     text.lines().any(|l| {
         l.find("-----BEGIN")

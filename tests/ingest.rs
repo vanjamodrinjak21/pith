@@ -393,11 +393,14 @@ fn deny_table() {
     assert_eq!(got, want);
 }
 
+/// Split so this file does not itself carry a key header and stays indexable.
+const PEM_BEGIN: &str = concat!("-----", "BEGIN");
+
 #[test]
 fn private_key_content_is_skipped_whatever_the_name() {
     let d = tempfile::tempdir().unwrap();
     for (i, kind) in ["RSA", "EC", "OPENSSH", "ENCRYPTED", ""].iter().enumerate() {
-        let hdr = format!("-----BEGIN {kind} PRIVATE KEY-----").replace("  ", " ");
+        let hdr = format!("{PEM_BEGIN} {kind} PRIVATE KEY-----").replace("  ", " ");
         write(
             d.path(),
             &format!("notes{i}.txt"),
@@ -504,7 +507,7 @@ fn unreadable_directory_is_reported_with_its_path() {
 #[test]
 fn hardlinked_pem_under_another_name_is_caught_by_content() {
     let d = tempfile::tempdir().unwrap();
-    let hdr = format!("-----BEGIN {} PRIVATE KEY-----", "RSA");
+    let hdr = format!("{PEM_BEGIN} RSA PRIVATE KEY-----");
     write(d.path(), "server.pem", format!("{hdr}\nMIIE\n"));
     fs::hard_link(d.path().join("server.pem"), d.path().join("notes.txt")).unwrap();
     let r = collect(d.path()).unwrap();
