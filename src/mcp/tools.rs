@@ -1,7 +1,7 @@
-use super::budget::{clean_block, fit_budget, render_hit, tokens};
 use super::State;
-use crate::commands::{age, clean, unix_now, valid_head};
-use crate::{render_error, render_stats, search_project, stats_project, Error, SearchHit};
+use crate::budget::{clean_block, context, DEFAULT_K as K_DEFAULT, MAX_PER_FILE, MAX_TOKENS};
+use crate::commands::{clean, unix_now};
+use crate::{render_error, render_stats, search_project, stats_project, Error};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::schemars::JsonSchema;
@@ -9,10 +9,7 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::Deserialize;
 use std::sync::Arc;
 
-const MAX_TOKENS: usize = 4000;
-const MAX_PER_FILE: usize = 3;
-const SNIPPET_LINES: usize = 15;
-const DEFAULT_K: u32 = 8;
+const DEFAULT_K: u32 = K_DEFAULT as u32;
 const MAX_K: u32 = 20;
 const MAX_QUERY_CHARS: usize = 2000;
 
@@ -80,22 +77,6 @@ impl Server {
     }
 }
 
-/// First line of every search_code response: index age, plus the git head only when valid.
-pub(crate) fn staleness(git_head: Option<&str>, indexed_at: u64, now: u64) -> String {
-    let mut out = format!("indexed {}", age(now.saturating_sub(indexed_at)));
-    if let Some(h) = git_head.filter(|h| valid_head(h)) {
-        out.push_str(&format!(" at git {h}"));
-    }
-    out.push('\n');
-    out
-}
-
-pub(crate) fn render_response(header: &str, hits: &[SearchHit]) -> String {
-    let mut out = header.to_string();
-    out.extend(hits.iter().map(render_hit));
-    out
-}
-
 const CUT_MARKER: &str = "\n[truncated: chunk exceeds the response cap]\n";
 
 /// One full chunk, cut to the same token cap as search_code (chars / 4).
@@ -142,11 +123,14 @@ impl Server {
                 .state
                 .with_embedder(|e| search_project(root, db, e, query, k * MAX_PER_FILE))?;
             let meta = db.meta();
-            let header = staleness(meta.git_head.as_deref(), meta.indexed_at_unix, unix_now());
-            let budget = MAX_TOKENS.saturating_sub(tokens(header.chars().count()));
-            let mut hits = fit_budget(hits, budget, MAX_PER_FILE, SNIPPET_LINES);
-            hits.truncate(k);
-            Ok(render_response(&header, &hits))
+            let c = context(
+                &hits,
+                meta.git_head.as_deref(),
+                meta.indexed_at_unix,
+                unix_now(),
+                k,
+            );
+            Ok(c.text)
         })
     }
 }
@@ -189,6 +173,7 @@ pub(crate) async fn serve(state: Arc<State>, max_line: usize) -> crate::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::staleness;
 
     #[test]
     fn get_chunk_output_is_capped() {

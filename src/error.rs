@@ -37,6 +37,8 @@ pub enum Error {
     Integrity(String),
     #[error("embedding failed: {0}")]
     Embed(String),
+    #[error("indexing cancelled")]
+    Cancelled,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
