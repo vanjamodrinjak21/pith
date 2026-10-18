@@ -7,6 +7,8 @@ specifically the [variant used by Rust](http://doc.crates.io/manifest.html#the-v
 The on-disk format is unstable until 1.0.
 
 ## [Unreleased] - TBD
+
+## [0.1.1] - 2026-10-18
 ### Added
 - `SECURITY.md`, `CHANGELOG.md` and a library example (`examples/search_project.rs`).
 - A CI job that builds and tests on the MSRV, now documented in the README.
