@@ -52,9 +52,9 @@ The model is loaded on the first search and dropped after 5 idle minutes.
   archive (~80 MB, cached in `~/Library/Caches/ort.pyke.io` or `~/.cache/ort.pyke.io`) from pyke's
   CDN **at build time**. That is the only network access during the build. Offline or air-gapped
   builds: point `ORT_LIB_PATH` at a self-built static ONNX Runtime.
-- Verified on macOS arm64 only (M4 Pro; release binary about 38 MB with the MCP server). Linux
-  x86_64 uses the same mechanism but is untested; CI for it is configured in
-  `.github/workflows/ci.yml` and has not run yet.
+- **macOS (Apple Silicon) is the supported platform for 0.1** (verified on an M4 Pro; release
+  binary about 38 MB with the MCP server). Linux and Windows are not tested or supported yet; the
+  code has an AVX2 path for x86_64 that has never run on real hardware.
 - `cargo install pithdb --no-default-features` builds without ONNX Runtime (no embeddings).
 - Embedding uses batch size 1 by default. The int8 model quantizes activations dynamically with
   scales shared across a batch, so a text's vector depends on its batch neighbours (cosine to the

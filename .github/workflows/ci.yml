@@ -11,23 +11,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2.7.8
-      - run: grep -q avx2 /proc/cpuinfo  # the AVX2 kernel path must run here
-      - run: cargo test
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --no-default-features
-      - run: cargo clippy --all-targets --no-default-features -- -D warnings
-      - run: cargo install --path . --locked
-      - run: pith --version && pith model list
-
   macos:
     runs-on: macos-latest
     timeout-minutes: 45
