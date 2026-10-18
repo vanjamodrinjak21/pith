@@ -263,12 +263,7 @@ fn index_run(
         _ => gitignore_warning(root),
     };
     let r = r?;
-    let done = format!(
-        "indexed {} chunks from {} files in {:.1}s",
-        r.chunks,
-        r.files,
-        started.elapsed().as_secs_f64()
-    );
+    let done = r.summary(started.elapsed().as_secs_f64());
     Ok(match warning {
         Some(w) => format!("{done}; {w}"),
         None => done,

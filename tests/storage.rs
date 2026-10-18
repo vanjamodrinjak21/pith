@@ -102,12 +102,13 @@ fn table(flag: u8, entries: u32, tail: &[u8]) -> Vec<u8> {
         t.extend_from_slice(&i.to_le_bytes());
         t.extend_from_slice(&i.to_le_bytes());
         put_str(&mut t, "text");
+        t.extend_from_slice(blake3::hash(b"text").as_bytes());
     }
     t.extend_from_slice(tail);
     t
 }
 
-/// A version-1 file with all-zero vectors (valid: quantize(0) == 0), built
+/// A version-2 file with all-zero vectors (valid: quantize(0) == 0), built
 /// independently of the writer, so fields the writer never produces can be set
 /// while every checksum is valid.
 fn assemble(dim: u32, count: u32, packed: &[u8], raw_len: u64) -> Vec<u8> {
@@ -115,7 +116,7 @@ fn assemble(dim: u32, count: u32, packed: &[u8], raw_len: u64) -> Vec<u8> {
     let (q, f) = (vec![0u8; n], vec![0u8; 4 * n]);
     let mut b = Vec::new();
     b.extend_from_slice(b"PITHDB\0\0");
-    for v in [1, dim, count, 0] {
+    for v in [2, dim, count, 0] {
         b.extend_from_slice(&v.to_le_bytes());
     }
     b.extend_from_slice(&(packed.len() as u64).to_le_bytes());
@@ -469,22 +470,16 @@ fn zero_entries() -> Vec<StoredChunk> {
 }
 
 #[test]
-fn table_over_ratio_bound_refused_at_write_and_read() {
+fn table_over_ratio_bound_refused_on_read() {
+    // The per-chunk text hash keeps writer tables under the bound: even 1M identical empty
+    // chunks round-trip.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(".pith");
     let chunks = zero_entries();
     let index = VectorIndex::build(vec![vec![1.0]; chunks.len()]).unwrap();
-    match Db::write(&path, "m", chunks, &index, meta()) {
-        Err(Error::Invalid(m)) => {
-            assert!(
-                m.contains("too repetitive") && m.contains(".pithignore"),
-                "{m}"
-            )
-        }
-        other => panic!("{other:?}"),
-    }
-    assert!(!path.exists());
-    // The same kind of table crafted into a file is refused on open.
+    Db::write(&path, "m", chunks, &index, meta()).unwrap();
+    assert_eq!(Db::open(&path, None).unwrap().chunks().len(), 1_000_000);
+    // A table of zeros crafted into a file is refused on open.
     let mut raw = table(0, 0, &[]);
     raw.resize(raw.len() + 16 * 1_000_000, 0);
     let packed = zstd::bulk::compress(&raw, 19).unwrap();
@@ -531,8 +526,8 @@ fn decompression_is_bounded_by_stated_raw_length() {
     // Over the count-derived bound by one byte (count 0 and count 1).
     let m = corrupt_msg(&assemble(4, 0, &packed, 64 * 1024 + 1));
     assert!(m.contains("over limit 65536 for 0 chunks"), "{m}");
-    let m = corrupt_msg(&assemble(1, 1, &packed, 9_696 + 65_536 + 1));
-    assert!(m.contains("over limit 75232 for 1 chunks"), "{m}");
+    let m = corrupt_msg(&assemble(1, 1, &packed, 9_728 + 65_536 + 1));
+    assert!(m.contains("over limit 75264 for 1 chunks"), "{m}");
     // 1 GiB claimed by a header whose count (200k, dim 1) allows it, with a tiny
     // payload: the ratio bound (compressed bytes * 16384 + 64 KiB) refuses it.
     let m = corrupt_msg(&assemble(1, 200_000, &packed, 1 << 30));
@@ -848,4 +843,18 @@ proptest! {
         prop_assert_eq!(db.index().full(), index.full());
         prop_assert_eq!(db.index().quantized(), index.quantized());
     }
+}
+
+#[test]
+fn text_hash_must_match_text() {
+    let mut raw = table(0, 1, &[]);
+    let n = raw.len();
+    raw[n - 1] ^= 1;
+    assert_eq!(
+        corrupt_msg(&assemble_table(1, 1, &raw)),
+        "chunk 0 text hash mismatch"
+    );
+    let db = open_bytes(&assemble_table(1, 1, &table(0, 1, &[]))).unwrap();
+    assert_eq!(db.text_hash(0), Some(blake3::hash(b"text").as_bytes()));
+    assert_eq!(db.text_hash(1), None);
 }

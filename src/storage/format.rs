@@ -1,11 +1,11 @@
-//! On-disk layout of a Pith database file (format version 1, unstable until 1.0).
+//! On-disk layout of a Pith database file (format version 2, unstable until 1.0).
 //!
 //! All integers and floats are little-endian. Big-endian targets are refused at
 //! compile time, because the f32 section is viewed in place as native `f32`.
 //!
 //! ```text
 //! 0    magic            8   b"PITHDB\0\0"
-//! 8    format_version   u32 = 1 (checked before anything else; unknown -> UnsupportedFormat)
+//! 8    format_version   u32 = 2 (checked before anything else; unknown -> UnsupportedFormat)
 //! 12   dim              u32 vector dimension (> 0; may have zero vectors)
 //! 16   count            u32 number of chunks == number of vectors
 //! 20   reserved         u32 must be 0
@@ -35,13 +35,16 @@
 //! padding included, fails), per-section hashes, the chunk table decompressed with a
 //! hard bound (`table_raw_len`, itself capped by the
 //! count, by `chunks_len * MAX_RATIO` and by a ceiling) and parsed with bounds checks (must
-//! be consumed exactly, hold `count` entries, UTF-8 strings), `dim > 0`,
+//! be consumed exactly, hold `count` entries, UTF-8 strings, each `text_hash` equal to blake3
+//! of its text), `dim > 0`,
 //! chunk count == vector count, and `VectorIndex::from_mapped` re-checks that the
 //! int8 data equals `quantize(f32)` and that all floats are finite.
 //!
 //! Chunk table (inside zstd): str model_id, u64 indexed_at_unix, u8 has_git_head,
-//! [str git_head], then `count` x (str path, u32 start_line, u32 end_line, str text);
-//! `str` is u32 length + UTF-8 bytes.
+//! [str git_head], then `count` x (str path, u32 start_line, u32 end_line, str text,
+//! 32 text_hash); `str` is u32 length + UTF-8 bytes. `text_hash` is blake3 of the text, the
+//! exact input the vector was embedded from; `pith index` reuses a vector by it.
+//! Version 1 had no `text_hash`.
 //!
 //! Unsupported (not detected after `open` validated the file): modifying a database
 //! file in place, or truncating it, while it is open. Pith itself only ever replaces
@@ -58,7 +61,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 pub const MAGIC: &[u8; 8] = b"PITHDB\0\0";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HEADER_LEN: usize = 168;
 const HASHED_HEADER: usize = 136;
 const HASHES_AT: usize = 40;
@@ -66,15 +69,15 @@ const HASHES_AT: usize = 40;
 pub const MIN_LEN: usize = HEADER_LEN + 32;
 /// Per-chunk raw table budget, derived from the chunker's limit
 /// (`crate::CHUNK_MAX_CHARS` = 1,400 chars, up to 4 UTF-8 bytes each) plus 4,096
-/// bytes for the path and the 16 bytes of entry overhead:
-/// 1,400 * 4 + 4,096 = 9,696 bytes.
+/// bytes for the path and the 16 bytes of entry overhead, plus the 32-byte text hash:
+/// 1,400 * 4 + 4,096 + 32 = 9,728 bytes.
 ///
 /// The whole table is bounded by `count * PER_CHUNK_MAX` (plus a fixed allowance);
 /// over it, `Db::write` refuses with `Error::Invalid`, as it does for the ratio bound
 /// (`MAX_RATIO`). Each field is also bounded: `CHUNK_MAX_CHARS` is enforced by the
 /// chunker (`ingest::chunk`), and `decode` rejects (`Db::write` refuses) text over
 /// [`MAX_TEXT_BYTES`] or a path over [`MAX_PATH_BYTES`].
-pub const PER_CHUNK_MAX: u64 = crate::CHUNK_MAX_CHARS as u64 * 4 + 4_096;
+pub const PER_CHUNK_MAX: u64 = crate::CHUNK_MAX_CHARS as u64 * 4 + 4_096 + 32;
 /// Longest stored chunk text, in bytes.
 pub const MAX_TEXT_BYTES: usize = crate::CHUNK_MAX_CHARS * 4;
 /// Longest stored path, in bytes.
@@ -103,9 +106,9 @@ pub const TABLE_SLACK: u64 = 64 << 10;
 /// Last-resort ceiling regardless of count: 4 GiB. The spec's scale is ~1M chunks;
 /// a typical chunk is ~1,400 ASCII bytes + ~100 path + 16 overhead, so 1M chunks
 /// is ~1.5e9 bytes < 4 GiB (4.29e9). Only pathological tables (e.g. 1M chunks of
-/// all-4-byte text, 1M * 9,696 = 9.7e9) hit it, and the writer refuses those.
+/// all-4-byte text, 1M * 9,728 = 9.7e9) hit it, and the writer refuses those.
 /// Note: 1M chunks of mostly-3-byte (CJK) text at the 1,400-char limit is ~4.3e9
-/// (1,400 * 3 + ~100 + 16 per chunk) and can exceed this ceiling; `Db::write` then
+/// (1,400 * 3 + ~100 + 48 per chunk) and can exceed this ceiling; `Db::write` then
 /// refuses with the actionable "too large" error. Raising the ceiling is a
 /// deliberate decision for later (it raises the worst-case allocation a crafted
 /// file can force), not an oversight.
@@ -118,7 +121,7 @@ pub const TABLE_RAW_CEILING: u64 = 4 << 30;
 /// `pith index` must not fail on them. The looser ratio is safe because it is not
 /// the primary bound: the layout check ties `count` to vector bytes that must really
 /// exist (`count * dim * 5 <= file size`), and `PER_CHUNK_MAX` bounds raw bytes per
-/// chunk, so at a realistic dim (384) raw <= 9,696 / 1,920 * file size, about 5x the
+/// chunk, so at a realistic dim (384) raw <= 9,728 / 1,920 * file size, about 5x the
 /// file size. Only a crafted tiny-dim file is exposed to this looser bound, and it
 /// still caps a 1 MB file at about 16 GB claimed, further clamped by the 4 GiB
 /// ceiling and reserved only as bytes are really produced.
@@ -172,6 +175,7 @@ pub struct Decoded {
     pub model_id: String,
     pub meta: IndexMeta,
     pub chunks: Vec<StoredChunk>,
+    pub hashes: Vec<[u8; 32]>,
     pub index: VectorIndex,
 }
 
@@ -253,6 +257,7 @@ pub fn encode(
         table.extend_from_slice(&c.start_line.to_le_bytes());
         table.extend_from_slice(&c.end_line.to_le_bytes());
         put_str(&mut table, &c.text)?;
+        table.extend_from_slice(blake3::hash(c.text.as_bytes()).as_bytes());
     }
     // Count check before compressing (passes the ratio check by construction);
     // after compressing, only the ratio check can still fail.
@@ -481,8 +486,9 @@ pub fn decode(map: Arc<memmap2::Mmap>) -> Result<Decoded> {
         1 => Some(r.str()?),
         _ => return Err(corrupt("bad git_head flag")),
     };
-    // Each entry is at least 16 bytes, which bounds the allocation by the real data.
-    let mut chunks = Vec::with_capacity(count.min(r.0.len() / 16));
+    // Each entry is at least 48 bytes, which bounds the allocation by the real data.
+    let cap = count.min(r.0.len() / 48);
+    let (mut chunks, mut hashes) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
     for _ in 0..count {
         chunks.push(StoredChunk {
             path: r.str()?,
@@ -490,12 +496,19 @@ pub fn decode(map: Arc<memmap2::Mmap>) -> Result<Decoded> {
             end_line: r.u32()?,
             text: r.str()?,
         });
+        hashes.push(r.take(32)?.try_into().expect("32 bytes"));
     }
     if !r.0.is_empty() {
         return Err(corrupt("trailing bytes in chunk table"));
     }
     if let Some(m) = oversized(&chunks) {
         return Err(corrupt(m));
+    }
+    // Reuse trusts the hash, so it must really be the text's (only a crafted file differs).
+    if let Some(i) =
+        (0..chunks.len()).find(|&i| blake3::hash(chunks[i].text.as_bytes()) != hashes[i])
+    {
+        return Err(corrupt(format!("chunk {i} text hash mismatch")));
     }
     let [_, q, f] = ranges;
     let index =
@@ -508,6 +521,7 @@ pub fn decode(map: Arc<memmap2::Mmap>) -> Result<Decoded> {
             git_head,
         },
         chunks,
+        hashes,
         index,
     })
 }
@@ -612,10 +626,21 @@ mod tests {
     }
 
     #[test]
+    fn ratio_bound_used_by_the_writer_binds_at_its_limit() {
+        // Not reachable through `encode` (each entry's hash keeps the table compressible only so
+        // far), so the shared bound it relies on is checked directly.
+        let raw = 1u64 << 30;
+        let packed = (raw - TABLE_SLACK) / MAX_RATIO - 1;
+        let e = check_table_len(raw, packed, 1 << 20).unwrap_err();
+        assert!(e.contains("compressed bytes"), "{e}");
+        assert!(check_table_len(raw, packed + 1, 1 << 20).is_ok());
+    }
+
+    #[test]
     fn ceiling_is_4_gib() {
         assert_eq!(TABLE_RAW_CEILING, 4 << 30);
         assert_eq!(table_raw_max(u32::MAX as u64), 4 << 30);
-        assert_eq!(PER_CHUNK_MAX, 9_696);
+        assert_eq!(PER_CHUNK_MAX, 9_728);
     }
 
     #[test]

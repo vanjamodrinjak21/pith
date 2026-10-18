@@ -8,6 +8,21 @@ The on-disk format is unstable until 1.0.
 
 ## [Unreleased] - TBD
 
+## [0.3.0] - 2026-10-18
+**The on-disk format changed (version 2): rebuild existing indexes with `pith index --reindex`.**
+### Added
+- Incremental `pith index`: a chunk whose text is unchanged reuses its vector from the existing
+  index (looked up by a blake3 hash of the text), so only new or edited chunks are embedded.
+  Renamed, moved and duplicated content is not embedded again, and identical new chunks are
+  embedded once. When no chunk, file time or git head changed, `.pith` is left as it was and the
+  run reports "index is up to date". `--reindex` still embeds
+  everything. The summary line now reads `indexed N chunks from M files (X reused, Y embedded)`.
+- `IndexReport::{reused, embedded, up_to_date, summary}`, `Db::chunks` and `Db::text_hash`.
+
+### Changed
+- On-disk format version 2: each chunk stores the blake3 hash of its text, verified on open.
+  Version-1 files are refused with "run `pith index --reindex`".
+
 ## [0.2.0] - 2026-10-18
 ### Added
 - `pith ui`: a terminal UI (default `tui` feature) with four views: Stack (directory -> file ->

@@ -45,6 +45,7 @@ pub struct Db {
     model_id: String,
     meta: IndexMeta,
     chunks: Vec<StoredChunk>,
+    hashes: Vec<[u8; 32]>,
     index: VectorIndex,
 }
 
@@ -86,6 +87,7 @@ impl Db {
             model_id: d.model_id,
             meta: d.meta,
             chunks: d.chunks,
+            hashes: d.hashes,
             index: d.index,
         })
     }
@@ -126,6 +128,16 @@ impl Db {
 
     pub fn chunk(&self, id: u32) -> Option<&StoredChunk> {
         self.chunks.get(id as usize)
+    }
+
+    /// All chunks, in id order.
+    pub fn chunks(&self) -> &[StoredChunk] {
+        &self.chunks
+    }
+
+    /// blake3 of chunk `id`'s text: the exact input its vector was embedded from.
+    pub fn text_hash(&self, id: u32) -> Option<&[u8; 32]> {
+        self.hashes.get(id as usize)
     }
 
     pub fn index(&self) -> &VectorIndex {
