@@ -61,6 +61,10 @@ pith stats
 indexed 9 seconds ago; 0 of 3 results have changed sources
 ```
 
+Run `pith index` again after edits: chunks whose text is unchanged keep their vectors, so only
+changed chunks are embedded, and an unchanged project is reported up to date without rewriting
+`.pith`. `--reindex` embeds everything again.
+
 Files over 1 MiB are skipped. `pith index` adds `.pith` and `.pith.lock` to an existing
 `.gitignore`; it never creates one.
 
@@ -125,7 +129,8 @@ Measured on an M4 Pro, release build.
 | Search, 100k vectors x 384, k = 10 (`cargo bench --bench search`) | mean 1.20 ms; p50 1.19, p95 1.22, p99 1.28 ms over 2,000 queries, embedding excluded |
 | Embedding, 64 chunks, 1 thread (`cargo bench --bench index`) | about 2.45 s, roughly 26 chunks/s |
 | Embedding, 64 chunks, 8 threads | about 0.75 s, roughly 85 chunks/s |
-| `pith index` on this repository (342 chunks, 38 files) | 8.4 s |
+| `pith index` on this repository, first run (485 chunks, 47 files) | 11.9 s |
+| `pith index` again after editing one file (484 reused, 1 embedded) | 0.13 s wall clock, model load included |
 
 Embedding dominates indexing time. Batch size (8, 16, 32 or 64) makes no measurable difference,
 only the thread count does. Pith embeds with batch size 1 by default: the int8 model quantizes
