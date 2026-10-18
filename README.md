@@ -179,7 +179,7 @@ Measured on an M4 Pro, release build.
 | `pith index` on this repository, first run (485 chunks, 47 files) | 11.9 s |
 | `pith index` again after editing one file (484 reused, 1 embedded) | 0.13 s wall clock, model load included |
 | Keyword index build, this repository (526 chunks) | under 10 ms (`pith search --mode keyword` takes 0.01 s in all) |
-| Keyword index build, 100k synthetic chunks of about 600 chars | about 1.4 s, once per process (`cargo test --release --lib build_time -- --ignored`) |
+| Keyword index build, 100k synthetic chunks of about 600 chars | 1.4 to 1.8 s, once per process (`cargo test --release --lib build_time -- --ignored`) |
 
 Embedding dominates indexing time. Batch size (8, 16, 32 or 64) makes no measurable difference,
 only the thread count does. Pith embeds with batch size 1 by default: the int8 model quantizes
