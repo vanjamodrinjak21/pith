@@ -24,6 +24,22 @@ pub struct IndexReport {
     pub skipped: Vec<(String, SkipReason)>,
 }
 
+/// Indexing progress, passed to the callback of [`index_project_with_progress`].
+#[derive(Debug)]
+pub struct Progress<'a> {
+    /// Files and chunks found by the walk.
+    pub files: usize,
+    pub chunks: usize,
+    /// Files and chunks embedded so far.
+    pub files_done: usize,
+    pub chunks_done: usize,
+    /// Path of the last embedded chunk; empty before the first.
+    pub current: &'a str,
+    pub skipped: &'a [(String, SkipReason)],
+    /// Vectors embedded since the previous call, in chunk order.
+    pub vectors: &'a [Vec<f32>],
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
     pub chunk_id: u32,
@@ -187,25 +203,57 @@ fn update_gitignore(root: &Path, with_db: bool) -> Result<()> {
 /// existing index built with a different model (or unreadable) is an error. The writer lock is
 /// taken only for the final write, so a second concurrent writer fails with `Error::Locked`
 /// after it has done its embedding work. Progress goes to stderr, only when stderr is a TTY.
+/// Also lists `.pith` and `.pith.lock` in an existing `.gitignore` (a failure is a warning).
 pub fn index_project(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Result<IndexReport> {
+    let tty = std::io::stderr().is_terminal();
+    let mut shown = false;
+    let r = index_project_with_progress(root, embedder, reindex, &mut |p| {
+        if tty && p.chunks > 0 && p.chunks_done > 0 {
+            eprint!("\rembedding {}/{}", p.chunks_done, p.chunks);
+            shown = true;
+        }
+        true
+    });
+    if r.is_ok() && shown {
+        eprint!("\r\x1b[K");
+    }
+    // The lock file exists after any attempt (even a failed one), so keep it ignored on every exit.
+    if root.is_dir() {
+        if let Some(w) = gitignore_warning(root) {
+            eprintln!("{w}");
+        }
+    }
+    r
+}
+
+/// [`index_project`] without any output and without the `.gitignore` update. `progress` is
+/// called once after the walk, after every embedded group, and once more (with no new vectors)
+/// just before the new database replaces the old one. Returning false cancels with
+/// `Error::Cancelled`: the temp file is removed and the previous index stays as it was. The
+/// walk and the group being embedded are not interrupted; a cancel takes effect at the next call.
+pub fn index_project_with_progress(
+    root: &Path,
+    embedder: &dyn Embedder,
+    reindex: bool,
+    progress: &mut dyn FnMut(&Progress) -> bool,
+) -> Result<IndexReport> {
     if !root.metadata()?.is_dir() {
         return Err(Error::Invalid(format!(
             "{} is not a directory",
             root.display()
         )));
     }
-    let r = index_inner(root, embedder, reindex);
-    // The lock file exists after any attempt (even a failed one), so keep it ignored on every exit.
-    if let Some(w) = gitignore_warning(root) {
-        eprintln!("{w}");
-    }
-    r
+    index_inner(root, embedder, reindex, progress)
 }
 
 /// Best-effort `.gitignore` update; returns the warning text on failure.
-fn gitignore_warning(root: &Path) -> Option<String> {
+pub(crate) fn gitignore_warning(root: &Path) -> Option<String> {
     // `.pith` is listed only once it exists; a failed first run leaves just the lock file.
-    let with_db = root.join(DB_NAME).symlink_metadata().is_ok();
+    gitignore_warning_for(root, root.join(DB_NAME).symlink_metadata().is_ok())
+}
+
+/// [`gitignore_warning`], listing `.pith` only when `with_db` (a cancelled run lists just the lock).
+pub(crate) fn gitignore_warning_for(root: &Path, with_db: bool) -> Option<String> {
     update_gitignore(root, with_db).err().map(|e| {
         format!(
             "pith: warning: could not update .gitignore: {}",
@@ -214,7 +262,12 @@ fn gitignore_warning(root: &Path) -> Option<String> {
     })
 }
 
-fn index_inner(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Result<IndexReport> {
+fn index_inner(
+    root: &Path,
+    embedder: &dyn Embedder,
+    reindex: bool,
+    progress: &mut dyn FnMut(&Progress) -> bool,
+) -> Result<IndexReport> {
     let db_path = root.join(DB_NAME);
     // Fail fast if another writer is active, before the expensive embedding. Racy by nature: a
     // writer may start after this check, in which case `Db::write` still returns Locked.
@@ -226,8 +279,25 @@ fn index_inner(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Result<In
     let indexed_at_unix = unix_now();
     let CollectReport { chunks, skipped } = collect(root)?;
     let total = chunks.len();
-    let progress = total > 0 && std::io::stderr().is_terminal();
-    let mut vectors = Vec::with_capacity(total);
+    let files = chunks
+        .iter()
+        .map(|c| c.path.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let base = Progress {
+        files,
+        chunks: total,
+        files_done: 0,
+        chunks_done: 0,
+        current: "",
+        skipped: &skipped,
+        vectors: &[],
+    };
+    if !progress(&base) {
+        return Err(Error::Cancelled);
+    }
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(total);
+    let mut files_done = 0;
     for group in chunks.chunks(EMBED_GROUP) {
         let texts: Vec<String> = group.iter().map(|c| c.text.clone()).collect();
         let v = embedder.embed_passages(&texts)?;
@@ -238,13 +308,29 @@ fn index_inner(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Result<In
                 texts.len()
             )));
         }
+        let start = vectors.len();
         vectors.extend(v);
-        if progress {
-            eprint!("\rembedding {}/{total}", vectors.len());
+        // Chunks are sorted by path: a file is done once a later chunk has another path.
+        files_done = if vectors.len() == total {
+            files
+        } else {
+            files_done
+                + chunks[start..=vectors.len()]
+                    .windows(2)
+                    .filter(|w| w[0].path != w[1].path)
+                    .count()
+        };
+        let last = &group[group.len() - 1].path;
+        let p = Progress {
+            files_done,
+            chunks_done: vectors.len(),
+            current: last,
+            vectors: &vectors[start..],
+            ..base
+        };
+        if !progress(&p) {
+            return Err(Error::Cancelled);
         }
-    }
-    if progress {
-        eprint!("\r\x1b[K");
     }
     let index = if vectors.is_empty() {
         VectorIndex::from_parts(embedder.dim(), vec![], vec![])?
@@ -257,11 +343,7 @@ fn index_inner(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Result<In
             got: index.dim(),
         });
     }
-    let files = chunks
-        .iter()
-        .map(|c| c.path.as_str())
-        .collect::<HashSet<_>>()
-        .len();
+    let last = chunks.last().map(|c| c.path.clone()).unwrap_or_default();
     let stored = chunks
         .into_iter()
         .map(|c| StoredChunk {
@@ -275,7 +357,29 @@ fn index_inner(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Result<In
         indexed_at_unix,
         git_head: git_head(root),
     };
-    Db::write(&db_path, embedder.model_id(), stored, &index, meta)?;
+    // Last chance to cancel: after this the rename is the only step left.
+    let last_check = || {
+        let p = Progress {
+            files_done: files,
+            chunks_done: total,
+            current: &last,
+            vectors: &[],
+            ..base
+        };
+        if progress(&p) {
+            Ok(())
+        } else {
+            Err(Error::Cancelled)
+        }
+    };
+    Db::write_checked(
+        &db_path,
+        embedder.model_id(),
+        stored,
+        &index,
+        meta,
+        last_check,
+    )?;
     Ok(IndexReport {
         chunks: total,
         files,
@@ -546,6 +650,94 @@ pub(crate) fn clean(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_is_monotonic_and_ends_at_the_report_totals() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            let text: String = (0..30).map(|j| format!("fn f{i}_{j}() {{}}\n\n")).collect();
+            std::fs::write(d.path().join(format!("f{i}.rs")), text.repeat(8)).unwrap();
+        }
+        let mut seen: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+        let r =
+            index_project_with_progress(d.path(), &crate::embed::FakeEmbedder, false, &mut |p| {
+                seen.push((
+                    p.files,
+                    p.chunks,
+                    p.files_done,
+                    p.chunks_done,
+                    p.vectors.len(),
+                ));
+                true
+            })
+            .unwrap();
+        assert!(seen.len() > 2, "{seen:?}");
+        assert!(
+            seen.windows(2)
+                .all(|w| w[0].2 <= w[1].2 && w[0].3 <= w[1].3),
+            "{seen:?}"
+        );
+        assert!(seen.iter().all(|s| (s.0, s.1) == (r.files, r.chunks)));
+        assert_eq!(seen.iter().map(|s| s.4).sum::<usize>(), r.chunks);
+        let last = seen.last().unwrap();
+        assert_eq!((last.2, last.3), (r.files, r.chunks));
+    }
+
+    #[test]
+    fn cancel_just_before_the_rename_writes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "one\n").unwrap();
+        index_project(d.path(), &crate::embed::FakeEmbedder, false).unwrap();
+        let before = std::fs::read(d.path().join(DB_NAME)).unwrap();
+        std::fs::write(d.path().join("b.txt"), "two\n").unwrap();
+        let mut last = false;
+        let r =
+            index_project_with_progress(d.path(), &crate::embed::FakeEmbedder, false, &mut |p| {
+                // The final call: everything embedded, nothing new, the temp file already synced.
+                last = p.chunks_done == p.chunks && p.vectors.is_empty() && p.chunks > 0;
+                !last
+            });
+        assert!(last && matches!(r, Err(Error::Cancelled)), "{r:?}");
+        assert_eq!(std::fs::read(d.path().join(DB_NAME)).unwrap(), before);
+        let mut names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [".pith", ".pith.lock", "a.txt", "b.txt"],
+            "temp file removed"
+        );
+    }
+
+    #[test]
+    fn cancel_leaves_the_previous_index_intact() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "one\n").unwrap();
+        index_project(d.path(), &crate::embed::FakeEmbedder, false).unwrap();
+        let before = std::fs::read(d.path().join(DB_NAME)).unwrap();
+        std::fs::write(d.path().join("b.txt"), "two\n").unwrap();
+        for stop_after in [0, 1] {
+            let mut calls = 0;
+            let r = index_project_with_progress(
+                d.path(),
+                &crate::embed::FakeEmbedder,
+                false,
+                &mut |_| {
+                    calls += 1;
+                    calls <= stop_after
+                },
+            );
+            assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+        }
+        assert_eq!(std::fs::read(d.path().join(DB_NAME)).unwrap(), before);
+        let names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 4, "no temp file left: {names:?}");
+    }
 
     #[test]
     fn safe_join_rejects_escapes_and_symlinks() {

@@ -105,10 +105,23 @@ impl Db {
         index: &VectorIndex,
         meta: IndexMeta,
     ) -> Result<()> {
+        Self::write_checked(path, model_id, chunks, index, meta, || Ok(()))
+    }
+
+    /// [`write`](Self::write), calling `before_rename` once the temp file is synced; an error
+    /// from it aborts the write (temp file removed, `path` untouched) and is returned.
+    pub(crate) fn write_checked(
+        path: &Path,
+        model_id: &str,
+        chunks: Vec<StoredChunk>,
+        index: &VectorIndex,
+        meta: IndexMeta,
+        before_rename: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         if let Some(m) = format::oversized(&chunks) {
             return Err(Error::Invalid(m));
         }
-        write_inner(path, model_id, &chunks, index, &meta, || Ok(()))
+        write_inner(path, model_id, &chunks, index, &meta, before_rename)
     }
 
     pub fn chunk(&self, id: u32) -> Option<&StoredChunk> {

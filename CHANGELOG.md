@@ -8,6 +8,15 @@ The on-disk format is unstable until 1.0.
 
 ## [Unreleased] - TBD
 
+## [0.2.0] - 2026-10-18
+### Added
+- `pith ui`: a terminal UI (default `tui` feature) with four views: Stack (directory -> file ->
+  chunk with share-of-index bars), Map (2-D PCA of the vectors with density shading), RAG (what
+  `search_code` sends Claude, with dropped/trimmed hits and a token meter) and Index (live,
+  cancellable reindex with progress). `pith ui --index` indexes first.
+- `index_project_with_progress`, `Progress` and `Error::Cancelled` in the library.
+- `VectorIndex::scale`.
+
 ## [0.1.1] - 2026-10-18
 ### Added
 - `SECURITY.md`, `CHANGELOG.md` and a library example (`examples/search_project.rs`).

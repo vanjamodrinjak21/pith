@@ -155,6 +155,11 @@ impl VectorIndex {
         self.len() == 0
     }
 
+    /// The int8 quantization scale: `quantized[i] ≈ full[i] / scale`.
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
     pub fn quantized(&self) -> &[i8] {
         match &self.store {
             Store::Owned { quantized, .. } => quantized,

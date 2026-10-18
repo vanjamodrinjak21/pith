@@ -2,7 +2,6 @@
 //! `stats`. It never indexes, never writes, and never takes the writer lock. Stdout carries only
 //! the protocol; nothing else in this process may print there.
 
-mod budget;
 mod tools;
 
 use crate::embed::Embedder;
