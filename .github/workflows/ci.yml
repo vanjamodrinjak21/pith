@@ -28,6 +28,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89
+      - uses: dtolnay/rust-toolchain@1.92
       - uses: Swatinem/rust-cache@v2.7.8
       - run: cargo test

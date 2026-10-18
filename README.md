@@ -27,7 +27,7 @@ Features:
 
 ## Status
 
-Pith is `0.1`. macOS on Apple Silicon is the supported platform: that is where it is built and
+Pith is `0.1` and needs Rust 1.92 or newer to build. macOS on Apple Silicon is the supported platform: that is where it is built and
 tested (an M4 Pro; the release binary is about 38 MB). Linux and Windows are untested. There is
 no HNSW (search is a brute-force scan, see Performance), no incremental indexing and no
 non-code ingestion.

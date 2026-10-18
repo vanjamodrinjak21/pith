@@ -9,7 +9,10 @@ The on-disk format is unstable until 1.0.
 ## [Unreleased] - TBD
 ### Added
 - `SECURITY.md`, `CHANGELOG.md` and a library example (`examples/search_project.rs`).
-- A CI job that builds and tests on the documented MSRV (Rust 1.89).
+- A CI job that builds and tests on the MSRV, now documented in the README.
+
+### Fixed
+- `rust-version` is 1.92 (0.1.0 declared 1.89, but the ONNX Runtime bindings require 1.92).
 
 ## [0.1.0] - 2026-10-18
 ### Added

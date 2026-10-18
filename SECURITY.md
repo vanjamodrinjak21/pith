@@ -31,7 +31,8 @@ download) and answers MCP requests from a local client. These are the boundaries
   the writer lock, caps every response at about 4,000 tokens and every input line at 1 MiB.
 - **The model download is verified.** The manifest is compiled in and pinned to a commit. Each
   file is size-capped, sha256-checked, written to a private temporary file and renamed into
-  place. Only HTTPS is accepted, and redirects must stay on public DNS names.
+  place. Only HTTPS is accepted, and a redirect must go to a DNS name (not an IP literal or a
+  local-looking name); see the known limits for what that does not cover.
 - **Writes are atomic.** A single writer holds an advisory lock; a crash cannot leave a
   half-written index.
 
