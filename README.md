@@ -75,9 +75,11 @@ rows come from the ignored real-model embedding test (`cargo test --release --te
 | Embedding, batch 1, 4 threads / 1 thread | 33.3 / 15.5 chunks/s |
 | `pith index` on an early copy of this repo's `src/` (134 chunks) | 3.2 s |
 
-Embedding dominates: a 3,000-chunk repository takes about a minute to index. The batch 8/16/32/64
-and 1-8 thread grid in `cargo bench --bench index` is not measured yet (it needs the model
-installed; the bench skips itself otherwise). Search is a brute-force int8 scan with an f32
+Embedding dominates: a 3,000-chunk repository takes about a minute to index. `cargo bench --bench
+index` (64 chunks, M4 Pro, model installed) agrees: batch size 8/16/32/64 makes no difference
+(about 2.45 s at 1 thread, 0.75 s at 8 threads, roughly 26 and 85 chunks/s); only the thread count
+matters. The bench skips itself when the model is not installed. Indexing this repo (342 chunks)
+took 8.4 s. Search is a brute-force int8 scan with an f32
 rescore of the top candidates, not strictly exact: the true top-k can in principle be lost in the
 int8 pass.
 
