@@ -7,6 +7,8 @@ specifically the [variant used by Rust](http://doc.crates.io/manifest.html#the-v
 The on-disk format is unstable until 1.0.
 
 ## [Unreleased] - TBD
+
+## [0.2.0] - 2026-10-18
 ### Added
 - `pith ui`: a terminal UI (default `tui` feature) with four views: Stack (directory -> file ->
   chunk with share-of-index bars), Map (2-D PCA of the vectors with density shading), RAG (what
