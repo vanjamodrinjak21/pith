@@ -7,6 +7,9 @@ specifically the [variant used by Rust](http://doc.crates.io/manifest.html#the-v
 The on-disk format is unstable until 1.0.
 
 ## [Unreleased] - TBD
+
+## [0.3.0] - 2026-10-18
+**The on-disk format changed (version 2): rebuild existing indexes with `pith index --reindex`.**
 ### Added
 - Incremental `pith index`: a chunk whose text is unchanged reuses its vector from the existing
   index (looked up by a blake3 hash of the text), so only new or edited chunks are embedded.
