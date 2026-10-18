@@ -465,7 +465,7 @@ mod onnx {
         let d = tempfile::tempdir().unwrap();
         let err = OnnxEmbedder::load(d.path()).err().expect("must fail");
         assert!(matches!(err, Error::ModelMissing(_)), "{err}");
-        assert!(err.to_string().contains("pith model pull"));
+        assert!(err.to_string().contains("run `pith init`"));
     }
 
     #[test]
