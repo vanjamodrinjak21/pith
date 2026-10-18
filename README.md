@@ -145,12 +145,13 @@ in principle a true top-k hit can be lost in the int8 pass.
 
 - The format is unstable until 1.0 (above).
 - `source_changed` in results compares the file's mtime, in whole seconds, with the index time,
-  so an edit in the same second as indexing is missed.
+  so an edit in the same second as indexing is missed. (A file that was only touched is handled:
+  the next `pith index` rewrites the index time.)
 - Secret detection is path-based plus a PEM-header content check. An in-tree hardlink to a secret
   under another name is not caught by name, and headerless raw base64 keys are not caught by
   content. Directories named `.ssh`, `.gnupg`, `.aws` and `.kube` are never indexed.
 - The chunk table is bounded on decompression: an index whose table compresses better than
-  16,384:1 (plus a small allowance) is refused at write time.
+  16,384:1 (plus a small allowance) is refused when opened.
 - Model-download redirects are validated by host-name shape (https to a DNS name; no IP literals,
   `localhost`, `.local`, `.internal` and similar). There is no DNS lookup, so a public-looking
   name that resolves to a private address is not blocked.

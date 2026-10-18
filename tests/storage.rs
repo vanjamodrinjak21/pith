@@ -471,8 +471,8 @@ fn zero_entries() -> Vec<StoredChunk> {
 
 #[test]
 fn table_over_ratio_bound_refused_on_read() {
-    // The writer cannot reach the bound any more: the per-chunk text hash keeps even 1M
-    // identical empty chunks near 10,000:1, and such a table round-trips.
+    // The per-chunk text hash keeps writer tables under the bound: even 1M identical empty
+    // chunks round-trip.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(".pith");
     let chunks = zero_entries();

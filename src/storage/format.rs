@@ -626,6 +626,17 @@ mod tests {
     }
 
     #[test]
+    fn ratio_bound_used_by_the_writer_binds_at_its_limit() {
+        // Not reachable through `encode` (each entry's hash keeps the table compressible only so
+        // far), so the shared bound it relies on is checked directly.
+        let raw = 1u64 << 30;
+        let packed = (raw - TABLE_SLACK) / MAX_RATIO - 1;
+        let e = check_table_len(raw, packed, 1 << 20).unwrap_err();
+        assert!(e.contains("compressed bytes"), "{e}");
+        assert!(check_table_len(raw, packed + 1, 1 << 20).is_ok());
+    }
+
+    #[test]
     fn ceiling_is_4_gib() {
         assert_eq!(TABLE_RAW_CEILING, 4 << 30);
         assert_eq!(table_raw_max(u32::MAX as u64), 4 << 30);

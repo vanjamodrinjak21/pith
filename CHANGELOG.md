@@ -10,8 +10,9 @@ The on-disk format is unstable until 1.0.
 ### Added
 - Incremental `pith index`: a chunk whose text is unchanged reuses its vector from the existing
   index (looked up by a blake3 hash of the text), so only new or edited chunks are embedded.
-  Renamed, moved and duplicated content is not embedded again. When nothing changed, `.pith`
-  is left as it was and the run reports "index is up to date". `--reindex` still embeds
+  Renamed, moved and duplicated content is not embedded again, and identical new chunks are
+  embedded once. When no chunk, file time or git head changed, `.pith` is left as it was and the
+  run reports "index is up to date". `--reindex` still embeds
   everything. The summary line now reads `indexed N chunks from M files (X reused, Y embedded)`.
 - `IndexReport::{reused, embedded, up_to_date, summary}`, `Db::chunks` and `Db::text_hash`.
 

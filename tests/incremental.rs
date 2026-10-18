@@ -3,7 +3,10 @@
 
 use pithdb::embed::{Embedder, FakeEmbedder};
 use pithdb::storage::Db;
-use pithdb::{index_project, index_project_with_progress, Error, IndexReport, Result};
+use pithdb::{
+    index_project, index_project_with_progress, open_project, search_project, Error, IndexReport,
+    Result,
+};
 use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
@@ -185,8 +188,10 @@ fn progress_counts_reused_chunks_and_cancel_keeps_old_index() {
     let db = d.path().join(".pith");
     let before = fs::read(&db).unwrap();
     fs::write(d.path().join("b.rs"), "changed\n").unwrap();
+    // Enough new chunks for several groups of 32.
+    fs::write(d.path().join("big.rs"), lines("big", 3000)).unwrap();
 
-    // Cancel after the first group.
+    // Call 1 is after the walk, call 2 after the first group: cancel there, before the rest.
     let mut calls = 0;
     let r = index_project_with_progress(d.path(), &FakeEmbedder, false, &mut |_| {
         calls += 1;
@@ -205,7 +210,7 @@ fn progress_counts_reused_chunks_and_cancel_keeps_old_index() {
     .unwrap();
     assert_eq!(vectors_seen, r.chunks);
     assert_eq!(last, (r.chunks, r.chunks));
-    assert!(r.reused > 0 && r.embedded == 1);
+    assert!(r.reused > 0 && r.embedded > 32, "{r:?}");
 }
 
 #[test]
@@ -262,4 +267,91 @@ fn randomized_edits_equal_full_reindex() {
         e.index(d.path());
         assert_equals_full_reindex(d.path());
     }
+}
+
+#[test]
+fn identical_new_chunks_are_embedded_once() {
+    let d = project();
+    let e = Counting::default();
+    e.index(d.path());
+    let text = lines("twin", 3);
+    fs::write(d.path().join("x.rs"), &text).unwrap();
+    fs::write(d.path().join("y.rs"), &text).unwrap();
+    let r = e.index(d.path());
+    assert_eq!(e.embedded(), [text.trim_end()]);
+    assert_eq!(r.embedded, 1);
+    assert_equals_full_reindex(d.path());
+}
+
+#[test]
+fn touched_file_rewrites_metadata_then_is_up_to_date() {
+    let d = project();
+    let e = Counting::default();
+    e.index(d.path());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let a = d.path().join("a.rs");
+    fs::write(&a, fs::read(&a).unwrap()).unwrap(); // same content, newer mtime
+    let r = e.index(d.path());
+    assert!(!r.up_to_date && r.embedded == 0, "{r:?}");
+    let (root, db) = open_project(d.path()).unwrap();
+    let text = db
+        .chunks()
+        .iter()
+        .find(|c| c.path == "a.rs")
+        .unwrap()
+        .text
+        .clone();
+    let hits = search_project(&root, &db, &FakeEmbedder, &text, 1).unwrap();
+    assert_eq!(hits[0].path, "a.rs");
+    assert!(!hits[0].source_changed);
+    assert!(e.index(d.path()).up_to_date);
+}
+
+#[test]
+fn git_head_change_with_identical_chunks_writes() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        println!("SKIPPED: git_head_change_with_identical_chunks_writes: git not found");
+        return;
+    }
+    let d = project();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(d.path())
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "a.rs", "b.rs", "sub"]);
+    git(&["commit", "-q", "-m", "one"]);
+    let e = Counting::default();
+    e.index(d.path());
+    let head = |p: &Path| {
+        Db::open(&p.join(".pith"), None)
+            .unwrap()
+            .meta()
+            .git_head
+            .clone()
+    };
+    let first = head(d.path());
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    let r = e.index(d.path());
+    assert!(!r.up_to_date && r.embedded == 0, "{r:?}");
+    assert_ne!(head(d.path()), first);
+    assert!(e.index(d.path()).up_to_date);
 }

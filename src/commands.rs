@@ -251,7 +251,8 @@ pub fn index_project(root: &Path, embedder: &dyn Embedder, reindex: bool) -> Res
 
 /// [`index_project`] without any output and without the `.gitignore` update. `progress` is
 /// called once after the walk, after every group (reused or embedded), and once more (with no
-/// new vectors) just before the new database replaces the old one. Returning false cancels with
+/// new vectors) just before the new database replaces the old one. When the index is up to date
+/// nothing is written and that last call is not made. Returning false cancels with
 /// `Error::Cancelled`: the temp file is removed and the previous index stays as it was. The
 /// walk and the group being embedded are not interrupted; a cancel takes effect at the next call.
 pub fn index_project_with_progress(
@@ -301,9 +302,9 @@ fn index_inner(
         open_existing(&db_path, embedder)?
     };
     // Text hash -> id in the old index. Equal text gives an equal vector (batch size 1).
-    let reuse: HashMap<&[u8; 32], u32> = old.as_ref().map_or_else(HashMap::new, |db| {
+    let reuse: HashMap<[u8; 32], u32> = old.as_ref().map_or_else(HashMap::new, |db| {
         (0..db.index().len() as u32)
-            .filter_map(|i| db.text_hash(i).map(|h| (h, i)))
+            .filter_map(|i| db.text_hash(i).map(|h| (*h, i)))
             .collect()
     });
     // Taken before the walk: any file edited after this second is flagged by `source_changed`.
@@ -330,23 +331,37 @@ fn index_inner(
     let dim = embedder.dim();
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(total);
     let (mut files_done, mut embedded) = (0, 0);
+    // Text hash -> position in `vectors`, for chunks done earlier in this run.
+    let mut fresh: HashMap<[u8; 32], usize> = HashMap::new();
     for group in chunks.chunks(EMBED_GROUP) {
         let start = vectors.len();
-        let hits: Vec<Option<u32>> = group
+        // Where each chunk's vector comes from: the old index, an earlier chunk of this run, or
+        // `texts[k]`. Identical new texts are embedded once.
+        enum From {
+            Old(u32),
+            Run(usize),
+            New(usize),
+        }
+        let mut texts: Vec<String> = Vec::new();
+        let mut in_group: HashMap<[u8; 32], usize> = HashMap::new();
+        let from: Vec<(From, [u8; 32])> = group
             .iter()
             .map(|c| {
-                reuse
-                    .get(blake3::hash(c.text.as_bytes()).as_bytes())
-                    .copied()
+                let h = *blake3::hash(c.text.as_bytes()).as_bytes();
+                let f = if let Some(&i) = reuse.get(&h) {
+                    From::Old(i)
+                } else if let Some(&j) = fresh.get(&h) {
+                    From::Run(j)
+                } else {
+                    From::New(*in_group.entry(h).or_insert_with(|| {
+                        texts.push(c.text.clone());
+                        texts.len() - 1
+                    }))
+                };
+                (f, h)
             })
             .collect();
-        let texts: Vec<String> = group
-            .iter()
-            .zip(&hits)
-            .filter(|(_, h)| h.is_none())
-            .map(|(c, _)| c.text.clone())
-            .collect();
-        let mut new = if texts.is_empty() {
+        let new = if texts.is_empty() {
             Vec::new()
         } else {
             embedder.embed_passages(&texts)?
@@ -359,12 +374,15 @@ fn index_inner(
             )));
         }
         embedded += texts.len();
-        let mut new = new.drain(..);
-        for h in hits {
-            vectors.push(match (h, &old) {
-                (Some(i), Some(db)) => db.index().full()[i as usize * dim..][..dim].to_vec(),
-                _ => new.next().expect("one embedded vector per miss"),
-            });
+        for (f, h) in from {
+            let v = match (f, &old) {
+                (From::Old(i), Some(db)) => db.index().full()[i as usize * dim..][..dim].to_vec(),
+                (From::Run(j), _) => vectors[j].clone(),
+                (From::New(k), _) => new[k].clone(),
+                (From::Old(_), None) => unreachable!("reuse is empty without an old index"),
+            };
+            fresh.entry(h).or_insert(vectors.len());
+            vectors.push(v);
         }
         // Chunks are sorted by path: a file is done once a later chunk has another path.
         files_done = if vectors.len() == total {
@@ -401,10 +419,21 @@ fn index_inner(
         indexed_at_unix,
         git_head: git_head(root),
     };
-    // Same chunks in the same order, all reused (so the same vectors), same git head: keep the
-    // old file, so readers that watch it do not reload for nothing.
+    // Same chunks in the same order, all reused (so the same vectors), same git head, and no file
+    // modified since the old index time: keep the old file, so readers that watch it do not
+    // reload for nothing. A touched file still gets a write, which moves `indexed_at` forward
+    // so `source_changed` clears.
     let up_to_date = old.as_ref().is_some_and(|db| {
-        embedded == 0 && db.chunks() == stored.as_slice() && db.meta().git_head == meta.git_head
+        let at = db.meta().indexed_at_unix;
+        embedded == 0
+            && db.chunks() == stored.as_slice()
+            && db.meta().git_head == meta.git_head
+            && !stored
+                .iter()
+                .map(|c| c.path.as_str())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .any(|p| changed_since(root, p, at))
     });
     // Unmapped before the write: on Windows a mapped file cannot be replaced.
     drop(reuse);
