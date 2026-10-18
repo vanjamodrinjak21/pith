@@ -9,7 +9,7 @@
 {"query": "cls_pool_normalize", "expect": ["src/embed/mod.rs:62-85"]}
 {"query": "decompress_bounded", "expect": ["src/storage/format.rs:375-415"]}
 {"query": "LineCap poll_read", "expect": ["src/mcp/mod.rs:140-198"]}
-{"query": "split_parts", "expect": ["src/index/bm25.rs"]}
+{"query": "build_capped", "expect": ["src/index/bm25.rs:131-183"]}
 {"query": "update_gitignore", "expect": ["src/commands.rs:150-228"]}
 {"query": "MAX_FILE_BYTES", "expect": ["src/ingest/walk.rs:11-11"]}
 {"query": "QUERY_PREFIX", "expect": ["src/embed/onnx.rs:1-40"]}
