@@ -18,6 +18,9 @@ Features:
  * Single-file database: checksummed sections, zstd-compressed chunk table, memory-mapped
    vectors, atomic writes, one writer at a time
  * Exact int8 SIMD scan (NEON, AVX2) with an f32 rescore of the top candidates; cosine similarity
+ * Hybrid search by default: embeddings fused with an in-memory BM25 keyword index that knows
+   identifiers (`search_with` also matches `search` and `with`), so exact names and error
+   strings are found; keyword search works without the model
  * Built-in embeddings: `bge-small-en-v1.5` (int8, 384 dimensions) through a statically linked
    ONNX Runtime, downloaded once, pinned to a commit and sha256-verified
  * Gitignore-aware indexing (`.gitignore`, `.ignore`, `.pithignore`) that skips secrets by name
@@ -61,6 +64,20 @@ pith stats
 indexed 9 seconds ago; 0 of 3 results have changed sources
 ```
 
+`--mode` picks how results are ranked:
+
+| Mode | Ranking | Needs the model |
+| --- | --- | --- |
+| `hybrid` (default) | reciprocal rank fusion (k = 60) of the top 50 by vector and the top 50 by BM25 | no: without it, keyword only, with a one-line notice |
+| `vector` | cosine similarity of embeddings | yes (`run pith init`) |
+| `keyword` | BM25 (k1 = 1.2, b = 0.75) over identifier-aware tokens | no |
+
+The score shown is the cosine similarity whenever the model is loaded (hybrid results are
+ordered by fused rank, so scores need not decrease); keyword-only scores are BM25 divided by the
+top hit's, so the first is 1.00. The keyword index is built in memory from the chunk texts on the
+first keyword or hybrid query and never stored. A chunk contributes at most 1,024 tokens, and once
+the index holds 16 Mi postings (about 128 MiB) later chunks are not keyword-indexed.
+
 Run `pith index` again after edits: chunks whose text is unchanged keep their vectors, so only
 changed chunks are embedded, and an unchanged project is reported up to date without rewriting
 `.pith`. `--reindex` embeds everything again.
@@ -77,14 +94,15 @@ claude mcp add pith -- pith mcp --project /path/to/project
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `search_code` | `query`, `k` (default 8, max 20) | ranked chunks with path, line range, score and chunk id |
+| `search_code` | `query`, `k` (default 8, max 20) | ranked chunks (hybrid search) with path, line range, score and chunk id |
 | `get_chunk` | `chunk_id` | the full text of one chunk |
 | `stats` | none | chunk count, model, index age |
 
 Each response is capped at about 4,000 tokens, with at most 3 chunks per file and about 15 lines
 per snippet. The server never indexes or writes: run `pith index` first, and again after big
 changes (a reindex is picked up without restarting). The embedding model loads on the first
-search and is dropped after 5 idle minutes.
+search and is dropped after 5 idle minutes. Without the model, `search_code` returns keyword
+results and says so in its second line.
 
 ## Terminal UI
 
@@ -120,6 +138,35 @@ Four views:
 
 `pith ui` needs an interactive terminal. Built with the default `tui` feature (ratatui).
 
+## Retrieval quality
+
+`pith eval <cases.jsonl> [-k 10] [--mode vector|keyword|hybrid] [--verbose]` measures search
+quality on hand-written cases, one JSON object per line:
+
+```json
+{"query": "where is the git head recorded", "expect": ["src/commands.rs:131-150"]}
+```
+
+An expectation is a path (any chunk of that file) or `path:start-end` (a hit must overlap those
+lines). It prints hit@1, hit@3, hit@k and MRR per mode (all three without `--mode`), plus token
+cost: the average size of what `search_code` would send against the average size of the expected
+whole files. `--verbose` lists the misses with what was returned.
+
+[`eval/pith.jsonl`](eval/pith.jsonl) holds 42 cases for this repository (26 identifier and
+error-string lookups, 16 questions), checked by hand against the code. On this repository
+(526 chunks, `bge-small-en-v1.5`, k = 10):
+
+| Mode | hit@1 | hit@3 | hit@10 | MRR | tokens sent | whole files |
+| --- | --- | --- | --- | --- | --- | --- |
+| vector | 0.50 | 0.67 | 0.90 | 0.62 | 1,325 | 4,961 |
+| keyword | 0.48 | 0.60 | 0.93 | 0.60 | 1,404 | 4,961 |
+| hybrid | 0.52 | 0.76 | 0.93 | 0.65 | 1,348 | 4,961 |
+
+Hybrid is the default because it beats vector search on the identifier cases (MRR 0.63 vs 0.60,
+hit@3 0.73 vs 0.65) without losing on the questions (MRR 0.69 vs 0.66, hit@3 0.81 vs 0.69).
+Keyword search alone is best at hit@1 on identifiers (0.54) but weakest on questions. A
+`search_code` call costs about 3.7x fewer tokens than reading the expected files whole.
+
 ## Performance
 
 Measured on an M4 Pro, release build.
@@ -131,6 +178,8 @@ Measured on an M4 Pro, release build.
 | Embedding, 64 chunks, 8 threads | about 0.75 s, roughly 85 chunks/s |
 | `pith index` on this repository, first run (485 chunks, 47 files) | 11.9 s |
 | `pith index` again after editing one file (484 reused, 1 embedded) | 0.13 s wall clock, model load included |
+| Keyword index build, this repository (526 chunks) | under 10 ms (`pith search --mode keyword` takes 0.01 s in all) |
+| Keyword index build, 100k synthetic chunks of about 600 chars | about 1.4 s, once per process (`cargo test --release --lib build_time -- --ignored`) |
 
 Embedding dominates indexing time. Batch size (8, 16, 32 or 64) makes no measurable difference,
 only the thread count does. Pith embeds with batch size 1 by default: the int8 model quantizes

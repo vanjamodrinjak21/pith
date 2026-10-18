@@ -7,6 +7,23 @@ specifically the [variant used by Rust](http://doc.crates.io/manifest.html#the-v
 The on-disk format is unstable until 1.0.
 
 ## [Unreleased] - TBD
+### Added
+- Hybrid search, the new default: reciprocal rank fusion (k = 60) of the top 50 vector hits and
+  the top 50 BM25 hits. The BM25 index (k1 = 1.2, b = 0.75) is built in memory from the chunk
+  texts on the first keyword or hybrid query, with an identifier-aware tokenizer
+  (`parseHttpURL` also yields `parse`, `http`, `url`); the file format is unchanged. Memory is
+  bounded at 1,024 tokens per chunk and 16 Mi postings.
+- `pith search --mode vector|keyword|hybrid`; `search_with` and `SearchMode` in the library.
+- Without the embedding model, hybrid search (CLI, MCP `search_code`, `pith ui`) falls back to
+  keyword search with a one-line notice instead of failing. `--mode vector` still asks for
+  `pith init`.
+- `pith eval <cases.jsonl>`: hit@1, hit@3, hit@k, MRR and token cost per mode, and
+  `eval/pith.jsonl`, 42 hand-checked cases for this repository (results in the README).
+
+### Changed
+- `search_project` uses hybrid search. Hit scores stay cosine similarities when the model is
+  loaded; keyword-only scores are BM25 normalised to the top hit.
+- `.pithignore` excludes `eval/` from this repository's own index.
 
 ## [0.3.0] - 2026-10-18
 **The on-disk format changed (version 2): rebuild existing indexes with `pith index --reindex`.**
