@@ -150,7 +150,9 @@ mod tests {
         let mut got = vec![];
         dot_i8_rows(&q, &rows, |i, s| got.push((i, s)));
         let want: Vec<(usize, i32)> = rows
-            .chunks_exact(100)
+            .as_chunks::<100>()
+            .0
+            .iter()
             .map(|r| dot_i8_scalar(&q, r))
             .enumerate()
             .collect();
