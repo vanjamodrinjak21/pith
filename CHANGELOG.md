@@ -7,6 +7,8 @@ specifically the [variant used by Rust](http://doc.crates.io/manifest.html#the-v
 The on-disk format is unstable until 1.0.
 
 ## [Unreleased] - TBD
+
+## [0.4.0] - 2026-10-18
 ### Added
 - Hybrid search, the new default: reciprocal rank fusion (k = 60) of the top 50 vector hits and
   the top 50 BM25 hits. The BM25 index (k1 = 1.2, b = 0.75) is built in memory from the chunk
