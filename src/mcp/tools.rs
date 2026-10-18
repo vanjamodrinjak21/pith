@@ -1,0 +1,237 @@
+use super::budget::{clean_block, fit_budget, render_hit, tokens};
+use super::State;
+use crate::commands::{age, clean, unix_now, valid_head};
+use crate::{render_error, render_stats, search_project, stats_project, Error, SearchHit};
+use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
+use rmcp::schemars::JsonSchema;
+use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use serde::Deserialize;
+use std::sync::Arc;
+
+const MAX_TOKENS: usize = 4000;
+const MAX_PER_FILE: usize = 3;
+const SNIPPET_LINES: usize = 15;
+const DEFAULT_K: u32 = 8;
+const MAX_K: u32 = 20;
+const MAX_QUERY_CHARS: usize = 2000;
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct SearchArgs {
+    /// What to look for, in natural language or code.
+    query: String,
+    /// Maximum results (1-20, default 8).
+    k: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct ChunkArgs {
+    /// A `chunk_id` from a search_code result.
+    chunk_id: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct Server {
+    state: Arc<State>,
+    tool_router: ToolRouter<Self>,
+}
+
+/// Tool errors are shown to the model, so they say what to run and are sanitised.
+fn message(e: &Error) -> String {
+    match e {
+        Error::ModelMissing(_) => "embedding model is not installed; run `pith init`".into(),
+        e => render_error(e),
+    }
+}
+
+fn reply(r: crate::Result<String>) -> Result<String, String> {
+    r.map_err(|e| message(&e))
+}
+
+#[tool_router]
+impl Server {
+    /// Semantic search over the indexed project. Returns a few capped snippets (about 15 lines
+    /// each, at most 3 per file) with path, line range, score and chunk_id, plus index staleness.
+    #[tool]
+    async fn search_code(&self, Parameters(a): Parameters<SearchArgs>) -> Result<String, String> {
+        reply(self.search(&a.query, a.k))
+    }
+
+    /// Full text of one chunk by its chunk_id from search_code.
+    #[tool]
+    async fn get_chunk(&self, Parameters(a): Parameters<ChunkArgs>) -> Result<String, String> {
+        reply(self.state.with_db(|_, db| {
+            let c = db
+                .chunk(a.chunk_id)
+                .ok_or_else(|| Error::Invalid(format!("no chunk with id {}", a.chunk_id)))?;
+            Ok(render_chunk(c))
+        }))
+    }
+
+    /// Index statistics: chunk and file counts, model, size, age and git head.
+    #[tool]
+    async fn stats(&self) -> Result<String, String> {
+        reply(
+            self.state
+                .with_db(|root, db| Ok(render_stats(&stats_project(root, db)?))),
+        )
+    }
+}
+
+/// First line of every search_code response: index age, plus the git head only when valid.
+pub(crate) fn staleness(git_head: Option<&str>, indexed_at: u64, now: u64) -> String {
+    let mut out = format!("indexed {}", age(now.saturating_sub(indexed_at)));
+    if let Some(h) = git_head.filter(|h| valid_head(h)) {
+        out.push_str(&format!(" at git {h}"));
+    }
+    out.push('\n');
+    out
+}
+
+pub(crate) fn render_response(header: &str, hits: &[SearchHit]) -> String {
+    let mut out = header.to_string();
+    out.extend(hits.iter().map(render_hit));
+    out
+}
+
+const CUT_MARKER: &str = "\n[truncated: chunk exceeds the response cap]\n";
+
+/// One full chunk, cut to the same token cap as search_code (chars / 4).
+fn render_chunk(c: &crate::storage::StoredChunk) -> String {
+    let mut out = format!(
+        "{}:{}-{}\n{}\n",
+        clean(&c.path),
+        c.start_line,
+        c.end_line,
+        clean_block(&c.text)
+    );
+    let max = MAX_TOKENS * 4;
+    if out.chars().count() > max {
+        let keep = max - CUT_MARKER.chars().count();
+        out = out.chars().take(keep).collect();
+        out.push_str(CUT_MARKER);
+    }
+    out
+}
+
+fn validate_query(query: &str) -> crate::Result<()> {
+    if query.trim().is_empty() {
+        return Err(Error::Invalid("query must not be empty".into()));
+    }
+    if query.chars().count() > MAX_QUERY_CHARS {
+        return Err(Error::Invalid(format!(
+            "query is longer than {MAX_QUERY_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn clamp_k(k: Option<u32>) -> usize {
+    k.unwrap_or(DEFAULT_K).clamp(1, MAX_K) as usize
+}
+
+impl Server {
+    fn search(&self, query: &str, k: Option<u32>) -> crate::Result<String> {
+        validate_query(query)?;
+        let k = clamp_k(k);
+        self.state.with_db(|root, db| {
+            // Over-fetch so the per-file cap still leaves up to k results.
+            let hits = self
+                .state
+                .with_embedder(|e| search_project(root, db, e, query, k * MAX_PER_FILE))?;
+            let meta = db.meta();
+            let header = staleness(meta.git_head.as_deref(), meta.indexed_at_unix, unix_now());
+            let budget = MAX_TOKENS.saturating_sub(tokens(header.chars().count()));
+            let mut hits = fit_budget(hits, budget, MAX_PER_FILE, SNIPPET_LINES);
+            hits.truncate(k);
+            Ok(render_response(&header, &hits))
+        })
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for Server {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("pith", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Read-only code search over this project's Pith index. Use search_code before \
+                 reading whole files; use get_chunk for a full chunk.",
+            )
+    }
+}
+
+pub(crate) async fn serve(state: Arc<State>, max_line: usize) -> crate::Result<()> {
+    let server = Server {
+        state,
+        tool_router: Server::tool_router(),
+    };
+    let input = super::LineCap::new(tokio::io::stdin(), max_line);
+    let tripped = input.tripped();
+    let running = server
+        .serve((input, tokio::io::stdout()))
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+    running
+        .waiting()
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+    if tripped.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(Error::Invalid(
+            "MCP message longer than the line limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_chunk_output_is_capped() {
+        let c = |text: String| crate::storage::StoredChunk {
+            path: "a.rs".into(),
+            start_line: 1,
+            end_line: 1,
+            text,
+        };
+        let small = render_chunk(&c("fn a() {}".into()));
+        assert_eq!(small, "a.rs:1-1\nfn a() {}\n");
+        let big = render_chunk(&c("é".repeat(50_000)));
+        assert_eq!(big.chars().count(), MAX_TOKENS * 4);
+        assert!(big.ends_with(CUT_MARKER));
+    }
+
+    #[test]
+    fn k_is_clamped_to_1_through_20() {
+        assert_eq!(clamp_k(Some(0)), 1);
+        assert_eq!(clamp_k(Some(1)), 1);
+        assert_eq!(clamp_k(Some(20)), 20);
+        assert_eq!(clamp_k(Some(21)), 20);
+        assert_eq!(clamp_k(None), DEFAULT_K as usize);
+    }
+
+    #[test]
+    fn query_length_limit_is_2000_chars() {
+        assert!(validate_query(&"é".repeat(2000)).is_ok());
+        assert!(validate_query(&"é".repeat(2001)).is_err());
+        assert!(validate_query(" \n").is_err());
+    }
+
+    #[test]
+    fn staleness_shows_only_a_valid_git_head() {
+        let good = "a".repeat(40);
+        assert!(staleness(Some(&good), 0, 5).contains(&good));
+        for bad in [
+            "\x1b[31m",
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+            "abc",
+        ] {
+            let s = staleness(Some(bad), 0, 5);
+            assert_eq!(s, "indexed 5 seconds ago\n", "{bad:?}");
+        }
+    }
+}
