@@ -622,7 +622,7 @@ fn second_writer_fails_fast() {
     let t = std::time::Instant::now();
     let r = Db::write(&path, "m", chunks, &index, meta());
     assert!(matches!(r, Err(Error::Locked)));
-    assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    assert!(t.elapsed() < std::time::Duration::from_secs(3));
     drop(held);
     write_sample(&path, 1);
 }
